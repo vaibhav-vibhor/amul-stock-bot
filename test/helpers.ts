@@ -48,7 +48,9 @@ export class Upstream {
         if (this.telegramResponse) return this.telegramResponse(call);
         return Response.json({
           ok: true,
-          result: call.method === "answerCallbackQuery" ? true : { message_id: this.telegram.length },
+          result: call.method === "answerCallbackQuery" ? true : {
+            message_id: call.method === "editMessageText" ? call.payload.message_id : this.telegram.length,
+          },
         });
       }
       if (url.origin !== "https://shop.amul.com") throw new Error("Unexpected test fetch target");
@@ -135,14 +137,14 @@ export function command(id: number, text: string, owner = Number(env.TELEGRAM_OW
   };
 }
 
-export function callback(id: number, data: string, callbackId = `fictional-callback-${id}`) {
+export function callback(id: number, data: string, callbackId = `fictional-callback-${id}`, messageId = 100) {
   return {
     update_id: id,
     callback_query: {
       id: callbackId,
       from: { id: Number(env.TELEGRAM_OWNER_ID) },
       data,
-      message: { message_id: 100, chat: { id: Number(env.TELEGRAM_OWNER_ID), type: "private" } },
+      message: { message_id: messageId, chat: { id: Number(env.TELEGRAM_OWNER_ID), type: "private" } },
     },
   };
 }

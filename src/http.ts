@@ -51,6 +51,14 @@ export class Network {
     return this.deadline - Date.now();
   }
 
+  remainingRequests(): number {
+    return MAX_SUBREQUESTS - this.requests;
+  }
+
+  async pause(milliseconds: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, milliseconds));
+  }
+
   async request(
     url: URL,
     options: RequestInit,

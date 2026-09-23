@@ -13,6 +13,7 @@ export interface AlertBinding {
 
 export interface Delivery {
   id: number;
+  dedupe_key: string;
   kind: OutboxKind;
   method: TelegramMethod;
   payload: string;
@@ -59,6 +60,16 @@ export class Store {
         callbackId ?? null,
       ).first(),
     );
+  }
+
+  async pendingProductMenu(revision: number): Promise<{ next_attempt_at: number } | null> {
+    return this.sql(
+      `SELECT next_attempt_at FROM outbox
+       WHERE state = 'pending' AND kind = 'reply'
+         AND config_revision = ? AND dedupe_key LIKE 'update:%:menu:%'
+       ORDER BY next_attempt_at LIMIT 1`,
+      revision,
+    ).first<{ next_attempt_at: number }>();
   }
 
   catalogPlan(catalog: Catalog): D1PreparedStatement[] {

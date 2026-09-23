@@ -149,12 +149,21 @@ export async function flushOutbox(env: Env, lease: Lease, network: Network): Pro
   if ((await store.config()).telegram_retry_at > Date.now()) return;
   const deliveries = await store.sql(
     `SELECT * FROM outbox WHERE state = 'pending' AND next_attempt_at <= ?
-     ORDER BY CASE kind WHEN 'callback' THEN 0 WHEN 'reply' THEN 1 ELSE 2 END, id LIMIT 6`,
+     ORDER BY CASE kind WHEN 'callback' THEN 0 WHEN 'reply' THEN 1 ELSE 2 END, id LIMIT 30`,
     now,
   ).all<Delivery>();
 
+  let menuDeliveries = 0;
+  let ordinaryDeliveries = 0;
   for (const delivery of deliveries.results) {
-    if (network.remaining() < 7_000) break;
+    const isMenu = /^update:\d+:menu:\d+$/.test(delivery.dedupe_key);
+    if (isMenu ? menuDeliveries >= 24 : ordinaryDeliveries >= 6) continue;
+    const paceMenu = isMenu && menuDeliveries > 0;
+    if (network.remaining() < (paceMenu ? 8_100 : 7_000) || network.remainingRequests() < 1) break;
+    // Large requested catalogs are consecutive private-chat replies, not a burst.
+    if (paceMenu) await network.pause(1_100);
+    if (isMenu) menuDeliveries++;
+    else ordinaryDeliveries++;
     // No config mutation can acquire this lease during the bounded external send.
     await lease.assertOwned(15);
     await lease.commit([

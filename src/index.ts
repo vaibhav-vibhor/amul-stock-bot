@@ -6,6 +6,8 @@ import { planCheck } from "./stock";
 import { flushOutbox, ownerUpdate, validateEnv, validWebhookSecret } from "./telegram";
 import type { Env } from "./types";
 
+export const MAX_WEBHOOK_BYTES = 128_000;
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const path = new URL(request.url).pathname;
@@ -21,7 +23,7 @@ export default {
         request.headers.get("X-Telegram-Bot-Api-Secret-Token"),
         env.TELEGRAM_WEBHOOK_SECRET,
       ))) return new Response("Forbidden", { status: 403 });
-      const body = await limitedText(new Response(request.body, { headers: request.headers }), 24_000);
+      const body = await limitedText(new Response(request.body, { headers: request.headers }), MAX_WEBHOOK_BYTES);
       const update = ownerUpdate(json(body, "invalid_update_json"), env.TELEGRAM_OWNER_ID);
       if (!update) return new Response("Ignored");
       const store = new Store(env.DB);
@@ -31,6 +33,17 @@ export default {
         const network = new Network();
         await processUpdate(env, lease, network, update);
         await flushOutbox(env, lease, network);
+        const config = await store.config();
+        const pendingMenu = await store.pendingProductMenu(config.revision);
+        if (pendingMenu) {
+          // Telegram retries the already-deduplicated update to drain requested
+          // overflow chunks even when scheduled polling is disabled.
+          const retryAt = Math.max(pendingMenu.next_attempt_at, config.telegram_retry_at);
+          return new Response("Menu delivery pending; retry", {
+            status: 503,
+            headers: { "Retry-After": String(Math.max(5, Math.ceil((retryAt - Date.now()) / 1_000))) },
+          });
+        }
         return new Response("OK");
       } finally {
         await lease.release();

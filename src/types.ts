@@ -56,6 +56,7 @@ export interface Button {
   text: string;
   callback_data?: string;
   url?: string;
+  style?: "danger" | "success" | "primary";
 }
 
 export interface Message {

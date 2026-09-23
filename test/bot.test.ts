@@ -1,11 +1,15 @@
 import { env } from "cloudflare:workers";
 import { applyD1Migrations, createScheduledController, reset } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { productPage } from "../src/commands";
 import { Store } from "../src/db";
+import { Network } from "../src/http";
+import { productMenus } from "../src/menus";
 import { splitMessages } from "../src/stock";
-import worker from "../src";
+import type { Button } from "../src/types";
+import worker, { MAX_WEBHOOK_BYTES } from "../src";
+import { proteinNames } from "./catalog";
 import { callback, command, fixtureProduct, seedTracked, tick, Upstream, webhook } from "./helpers";
+import type { TelegramCall } from "./helpers";
 
 let upstream: Upstream;
 let store: Store;
@@ -16,6 +20,7 @@ beforeEach(async () => {
   store = new Store(env.DB);
   upstream = new Upstream();
   upstream.install();
+  vi.spyOn(Network.prototype, "pause").mockResolvedValue();
   logged = [];
   vi.spyOn(console, "error").mockImplementation((...values: unknown[]) => { logged.push(values); });
 });
@@ -33,6 +38,11 @@ async function alerts() {
 
 function deliveredTexts() {
   return upstream.telegram.filter((call) => call.method !== "answerCallbackQuery").map((call) => String(call.payload.text));
+}
+
+function productButtons(call: TelegramCall): Button[] {
+  const markup = call.payload.reply_markup as { inline_keyboard: Button[][] };
+  return markup.inline_keyboard.flat().filter((button) => button.callback_data?.startsWith("pick:"));
 }
 
 describe("durable restock state machine", () => {
@@ -312,7 +322,7 @@ describe("owner-only Telegram controls", () => {
     const headers = { "X-Telegram-Bot-Api-Secret-Token": env.TELEGRAM_WEBHOOK_SECRET };
     const malformed = new Request("https://bot.example/telegram", { method: "POST", headers, body: "not-json" });
     expect((await worker.fetch(malformed, env)).status).toBe(400);
-    const oversized = new Request("https://bot.example/telegram", { method: "POST", headers, body: "x".repeat(24_001) });
+    const oversized = new Request("https://bot.example/telegram", { method: "POST", headers, body: "x".repeat(MAX_WEBHOOK_BYTES + 1) });
     expect((await worker.fetch(oversized, env)).status).toBe(413);
     expect(upstream.telegram).toEqual([]);
     expect((await store.sql("SELECT update_id FROM telegram_updates").all()).results).toEqual([]);
@@ -325,41 +335,202 @@ describe("owner-only Telegram controls", () => {
     expect(upstream.telegram).toEqual([]);
   });
 
-  it("lists paginated catalog products and bounds every output contract", async () => {
-    upstream.products = Array.from({ length: 13 }, (_, index) => ({
-      ...fixtureProduct(index), name: `Product ${index} ` + "x".repeat(280),
-    }));
+  it("delivers the full representative catalog in one full-name selection menu", async () => {
+    upstream.products = proteinNames.map((name, index) => ({ ...fixtureProduct(index), name }));
     expect((await webhook(command(1, "/products"))).status).toBe(200);
     const first = upstream.telegram[0]!.payload;
-    expect(String(first.text)).toContain("page 1/3");
+    expect(upstream.telegram).toHaveLength(1);
+    expect(String(first.text)).toContain("Selected: 0/23");
     expect(String(first.text).length).toBeLessThanOrEqual(4_096);
-    await webhook(callback(2, "page:1:2"));
-    const last = upstream.telegram.at(-1)!;
-    expect(last.method).toBe("editMessageText");
-    expect(String(last.payload.text)).toContain("page 3/3");
-    const page = productPage(await store.config(), await store.products(), 1);
-    for (const row of page.reply_markup!.inline_keyboard) {
+    const menus = productMenus(await store.config(), await store.products());
+    expect(menus).toHaveLength(1);
+    expect(first).toMatchObject(menus[0]!);
+    for (const row of menus[0]!.reply_markup!.inline_keyboard) {
       for (const button of row) {
+        expect(button.url).toBeUndefined();
         if (button.callback_data) expect(new TextEncoder().encode(button.callback_data).length).toBeLessThanOrEqual(64);
       }
     }
     const chunks = splitMessages("Snapshot", Array.from({ length: 200 }, () => "x".repeat(350)));
     expect(chunks.length).toBeGreaterThan(1);
     expect(chunks.every((message) => message.text.length <= 4_096)).toBe(true);
-    const unicodePage = productPage(await store.config(), (await store.products()).map((product) => ({
+    const unicodePage = productMenus(await store.config(), (await store.products()).map((product) => ({
       ...product, name: "a" + "\u{1F95B}".repeat(25),
-    })), 0);
+    })))[0]!;
     const buttonText = unicodePage.reply_markup!.inline_keyboard[0]![0]!.text;
     expect(new TextDecoder().decode(new TextEncoder().encode(buttonText))).toBe(buttonText);
   });
 
+  it("immediately edits the tapped message from committed select/deselect state without refetching Amul", async () => {
+    await seedTracked(0, 2);
+    const baselines = await store.observations();
+    upstream.products = proteinNames.map((name, index) => ({ ...fixtureProduct(index), name }));
+    await webhook(command(1, "/products"));
+    const amulRequests = upstream.amul.length;
+    const catalog = await store.products();
+    const selectedProductId = catalog[2]!.id;
+    const lastProductId = catalog.at(-1)!.id;
+    const select = productButtons(upstream.telegram[0]!)[2]!.callback_data!;
+    expect(select).toBe(`pick:1:${selectedProductId}:1:1:${lastProductId}`);
+    expect((await webhook(callback(2, select, "select-third", 421))).status).toBe(200);
+    const selected = upstream.telegram.at(-1)!;
+    expect(selected.method).toBe("editMessageText");
+    expect(selected.payload.message_id).toBe(421);
+    expect(selected.payload.text).toContain("Selected: 3/23");
+    expect(productButtons(selected)[2]).toMatchObject({
+      text: `\u2705 ${selectedProductId}. ${proteinNames[2]}`,
+      style: "success",
+      callback_data: `pick:2:${selectedProductId}:0:1:${lastProductId}`,
+    });
+    expect((await store.products())[2]?.epoch).toBeTypeOf("string");
+    expect(await store.observations()).toEqual(baselines);
+    expect((await webhook(callback(3, productButtons(selected)[2]!.callback_data!, "unselect-third", 421))).status).toBe(200);
+    const deselected = upstream.telegram.at(-1)!;
+    expect(deselected.method).toBe("editMessageText");
+    expect(deselected.payload.message_id).toBe(421);
+    expect(deselected.payload.text).toContain("Selected: 2/23");
+    expect(productButtons(deselected)[2]?.style).toBeUndefined();
+    expect(productButtons(deselected)[2]?.text).toBe(`\u2610 ${selectedProductId}. ${proteinNames[2]}`);
+    expect((await store.products())[2]?.epoch).toBeNull();
+    expect(await store.observations()).toEqual(baselines);
+    expect(upstream.amul).toHaveLength(amulRequests);
+    expect(await alerts()).toEqual([]);
+  });
+
+  it("automatically delivers overflow chunks and edits only the matching chunk with a local count", async () => {
+    upstream.products = Array.from({ length: 100 }, (_, index) => ({
+      ...fixtureProduct(index), name: `Product ${index} ` + "x".repeat(280),
+    }));
+    expect((await webhook(command(1, "/products"))).status).toBe(200);
+    const originalMenus = [...upstream.telegram];
+    expect(originalMenus.length).toBeGreaterThan(6);
+    expect(originalMenus.every((call) => call.method === "sendMessage")).toBe(true);
+    expect(originalMenus.flatMap(productButtons).map((button) => Number(button.callback_data!.split(":")[2])))
+      .toEqual(Array.from({ length: 100 }, (_, index) => index + 1));
+    expect(vi.mocked(Network.prototype.pause).mock.calls.every(([delay]) => delay === 1_100)).toBe(true);
+    const second = originalMenus[1]!;
+    const button = productButtons(second)[0]!;
+    const productId = Number(button.callback_data!.split(":")[2]);
+    const amulRequests = upstream.amul.length;
+    const before = upstream.telegram.length;
+    await webhook(callback(2, button.callback_data!, "chunk-two-selection", 852));
+    expect(upstream.telegram.slice(before).map((call) => call.method))
+      .toEqual(["answerCallbackQuery", "editMessageText"]);
+    const edited = upstream.telegram.at(-1)!;
+    expect(edited.payload.message_id).toBe(852);
+    expect(edited.payload.text).toContain(`Selected in this message: 1/${productButtons(second).length}`);
+    expect(productButtons(edited).map((item) => item.text.slice(2)))
+      .toEqual(productButtons(second).map((item) => item.text.slice(2)));
+    expect(productButtons(edited)[0]?.style).toBe("success");
+    expect((await store.products()).find((item) => item.id === productId)?.epoch).toBeTypeOf("string");
+    expect(upstream.amul).toHaveLength(amulRequests);
+    // Another chunk's old revision refreshes only that chunk, without applying
+    // a possibly stale intent or displaying an obsolete global selected count.
+    const firstButton = productButtons(originalMenus[0]!)[0]!;
+    await webhook(callback(3, firstButton.callback_data!, "stale-first-chunk", 851));
+    expect(upstream.telegram.at(-1)?.payload.message_id).toBe(851);
+    expect(upstream.telegram.at(-1)?.payload.text).toContain("Selected in this message: 0/");
+    expect((await store.products())[0]?.epoch).toBeNull();
+  });
+
+  it("continues a bounded overflow delivery on deduplicated webhook retries with no cron", async () => {
+    upstream.products = Array.from({ length: 100 }, (_, index) => ({
+      ...fixtureProduct(index), name: `Product ${index} ` + "x".repeat(280),
+    }));
+    const budget = vi.spyOn(Network.prototype, "remaining").mockReturnValue(45_000);
+    upstream.telegramResponse = () => {
+      if (upstream.telegram.length === 3) budget.mockReturnValue(0);
+      return Response.json({ ok: true, result: { message_id: upstream.telegram.length } });
+    };
+    const request = command(1, "/products");
+    const response = await webhook(request);
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Retry-After")).toBe("5");
+    expect(await store.processed(1)).toBe(true);
+    expect(upstream.telegram).toHaveLength(3);
+    const amulRequests = upstream.amul.length;
+    const selection = productButtons(upstream.telegram[0]!)[0]!.callback_data!;
+    await webhook(callback(2, selection));
+    expect((await store.products())[0]?.epoch).toBeNull();
+    expect((await store.config()).revision).toBe(1);
+    budget.mockRestore();
+    upstream.telegramResponse = undefined;
+    expect((await webhook(request)).status).toBe(200);
+    const allMenus = upstream.telegram.filter((call) => call.method === "sendMessage");
+    expect(allMenus.flatMap(productButtons).map((button) => Number(button.callback_data!.split(":")[2])))
+      .toEqual(Array.from({ length: 100 }, (_, index) => index + 1));
+    expect(upstream.amul).toHaveLength(amulRequests);
+    expect(await store.pendingProductMenu(1)).toBeNull();
+    expect(upstream.telegram.find((call) => call.method === "answerCallbackQuery")?.payload.text)
+      .toContain("catalog is still arriving");
+  });
+
+  it("keeps a failed menu pending for automatic webhook retry rather than requiring polling", async () => {
+    upstream.telegramResponse = () => Response.json({ ok: false, error_code: 429, parameters: { retry_after: 60 } }, { status: 429 });
+    const request = command(1, "/products");
+    const failed = await webhook(request);
+    expect(failed.status).toBe(503);
+    expect(Number(failed.headers.get("Retry-After"))).toBeGreaterThanOrEqual(59);
+    const amulRequests = upstream.amul.length;
+    await store.sql("UPDATE config SET telegram_retry_at = 0 WHERE id = 1").run();
+    await store.sql("UPDATE outbox SET next_attempt_at = 0 WHERE state = 'pending'").run();
+    upstream.telegramResponse = undefined;
+    expect((await webhook(request)).status).toBe(200);
+    expect(upstream.amul).toHaveLength(amulRequests);
+    expect(upstream.telegram).toHaveLength(2);
+    expect(upstream.telegram[1]?.payload).toEqual(upstream.telegram[0]?.payload);
+  });
+
+  it.each(["page:1:4", "track:1:1:0", "untrack:1:1:0", "page:999:0"])(
+    "safely upgrades an already-sent paginated callback %s without changing a watch",
+    async (data) => {
+      await seedTracked(0, 23);
+      const baselines = await store.observations();
+      expect((await webhook(callback(1, data))).status).toBe(200);
+      expect((await store.products()).filter((item) => item.epoch)).toHaveLength(23);
+      expect((await store.config()).revision).toBe(1);
+      expect(await store.observations()).toEqual(baselines);
+      expect(upstream.amul).toEqual([]);
+      expect(upstream.telegram[0]?.payload.text).toContain("Menu upgraded");
+      expect(productButtons(upstream.telegram.at(-1)!)).toHaveLength(23);
+    },
+  );
+
+  it("accepts a legitimate long Unicode menu echoed in a callback without relaxing owner authentication", async () => {
+    upstream.products = Array.from({ length: 23 }, (_, index) => ({
+      ...fixtureProduct(index), name: `${index} ` + "\u{1F95B}".repeat(140),
+    }));
+    await webhook(command(1, "/products"));
+    const original = upstream.telegram[0]!;
+    const update = callback(2, productButtons(original)[0]!.callback_data!);
+    const echo = {
+      ...update,
+      callback_query: {
+        ...update.callback_query,
+        message: { ...update.callback_query.message, text: original.payload.text, reply_markup: original.payload.reply_markup },
+      },
+    };
+    const body = JSON.stringify(echo).replace(/[^\x00-\x7f]/g, (unit) =>
+      `\\u${unit.charCodeAt(0).toString(16).padStart(4, "0")}`,
+    );
+    expect(body.length).toBeGreaterThan(24_000);
+    expect(body.length).toBeLessThan(MAX_WEBHOOK_BYTES);
+    const response = await worker.fetch(new Request("https://bot.example/telegram", {
+      method: "POST",
+      headers: { "X-Telegram-Bot-Api-Secret-Token": env.TELEGRAM_WEBHOOK_SECRET },
+      body,
+    }), env);
+    expect(response.status).toBe(200);
+    expect((await store.products())[0]?.epoch).toBeTypeOf("string");
+  });
+
   it("deduplicates webhook retries and callback IDs durably", async () => {
     await webhook(command(1, "/products"));
-    const update = callback(2, "track:1:1:0", "same-callback");
+    const update = callback(2, "pick:1:1:1:1:1", "same-callback");
     await webhook(update);
     const count = upstream.telegram.length;
     await webhook(update);
-    await webhook(callback(3, "track:1:1:0", "same-callback"));
+    await webhook(callback(3, "pick:1:1:1:1:1", "same-callback"));
     expect(upstream.telegram).toHaveLength(count);
     expect((await store.products())[0]?.epoch).not.toBeNull();
     expect((await store.config()).revision).toBe(2);
@@ -369,19 +540,20 @@ describe("owner-only Telegram controls", () => {
 
   it("rejects stale buttons and selections outside the catalog", async () => {
     await webhook(command(1, "/products"));
-    await webhook(callback(2, "track:1:999:0"));
+    await webhook(callback(2, "pick:1:999:1:1:999"));
     expect((await store.products())[0]?.epoch).toBeNull();
-    await webhook(callback(3, "track:1:1:0"));
-    await webhook(callback(4, "untrack:1:1:0"));
+    await webhook(callback(3, "pick:1:1:1:1:1"));
+    await webhook(callback(4, "pick:1:1:0:1:1"));
     expect((await store.products())[0]?.epoch).not.toBeNull();
-    expect(deliveredTexts().at(-1)).toContain("button is stale");
+    expect(upstream.telegram.filter((call) => call.method === "answerCallbackQuery").at(-1)?.payload.text)
+      .toContain("button is stale");
   });
 
   it("untracking/retracking establishes a new silent baseline", async () => {
     await seedTracked(0);
-    await webhook(callback(1, "untrack:1:1:0"));
+    await webhook(callback(1, "pick:1:1:0:1:1"));
     expect(await store.observations()).toEqual([]);
-    await webhook(callback(2, "track:2:1:0"));
+    await webhook(callback(2, "pick:2:1:1:1:1"));
     upstream.products = [fixtureProduct(0, 1)];
     await tick();
     expect(await alerts()).toEqual([]);
@@ -390,7 +562,7 @@ describe("owner-only Telegram controls", () => {
 
   it("keeps other products' baselines when one selection changes", async () => {
     await seedTracked(0, 2);
-    await webhook(callback(1, "untrack:1:2:0"));
+    await webhook(callback(1, "pick:1:2:0:1:2"));
     expect((await store.observations()).map((observation) => observation.product_id)).toEqual([1]);
     upstream.products = [fixtureProduct(0, 1), fixtureProduct(1, 1)];
     await tick();

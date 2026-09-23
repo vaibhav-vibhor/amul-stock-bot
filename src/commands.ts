@@ -1,14 +1,15 @@
-import { Amul, productUrl, validPincode } from "./amul";
+import { Amul, validPincode } from "./amul";
 import type { Lease, Store } from "./db";
 import { SafeError } from "./errors";
 import type { Network } from "./http";
+import { productMenus } from "./menus";
+import type { ProductRange } from "./menus";
 import { assertUpstreamReady, planCheck, upstreamFailure } from "./stock";
-import type { Button, Config, Env, Message, OwnerUpdate, StoredProduct } from "./types";
+import type { Config, Env, Message, OwnerUpdate, StoredProduct } from "./types";
 
-const PAGE_SIZE = 5;
 const HELP = `Amul protein restock bot (private owner only)
 
-/products - refresh the catalog; track/untrack with buttons
+/products - all products; tap full-name buttons to select/unselect
 /pincode 500032 - validate and change the delivery PIN
 /status - configuration, last successful check and errors
 /checknow - request a current stock snapshot
@@ -22,40 +23,6 @@ Availability is a snapshot, not a reservation. Short restocks between polls may 
 
 function time(value: number | null): string {
   return value === null ? "never (awaiting a complete successful check)" : new Date(value).toISOString();
-}
-
-export function productPage(
-  config: Config,
-  products: StoredProduct[],
-  requestedPage: number,
-  notice = "",
-): Message {
-  const pages = Math.max(1, Math.ceil(products.length / PAGE_SIZE));
-  const page = Math.max(0, Math.min(requestedPage, pages - 1));
-  const selected = products.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
-  const keyboard: Button[][] = selected.map((product) => [
-    {
-      text: `${product.epoch ? "Untrack" : "Track"} ${Array.from(product.name).slice(0, 38).join("")}`,
-      callback_data: `${product.epoch ? "untrack" : "track"}:${config.revision}:${product.id}:${page}`,
-    },
-    { text: "Open product", url: productUrl(product.alias) },
-  ]);
-  const navigation: Button[] = [];
-  if (page > 0) navigation.push({ text: "Previous", callback_data: `page:${config.revision}:${page - 1}` });
-  if (page < pages - 1) navigation.push({ text: "Next", callback_data: `page:${config.revision}:${page + 1}` });
-  if (navigation.length) keyboard.push(navigation);
-  keyboard.push([
-    { text: config.paused ? "Resume" : "Pause", callback_data: `${config.paused ? "resume" : "pause"}:${config.revision}` },
-    { text: "Status", callback_data: "status" },
-    { text: "Refresh", callback_data: "products" },
-  ]);
-  const lines = selected.map((product) =>
-    `${product.epoch ? "[TRACKED]" : "[not tracked]"} ${product.name}${product.active ? "" : "\nNot in the latest catalog: UNKNOWN. You can still untrack it."}`,
-  );
-  return {
-    text: `${notice ? `${notice}\n\n` : ""}Protein products for PIN ${config.pincode} - page ${page + 1}/${pages}\n${config.paused ? "PAUSED" : "Monitoring selected products"}\nCatalog: ${time(config.catalog_at)}\n\n${lines.join("\n\n") || "No catalog yet. Use /products to load it."}\n\nNew selections start with a silent baseline.`,
-    reply_markup: { inline_keyboard: keyboard },
-  };
 }
 
 async function status(store: Store, config: Config): Promise<Message> {
@@ -92,6 +59,7 @@ function queueReplies(
   messages: Message[],
   callbackNotice: string,
   revision: number,
+  menuReply: boolean,
 ): D1PreparedStatement[] {
   const statements: D1PreparedStatement[] = [];
   if (update.callback) {
@@ -118,7 +86,7 @@ function queueReplies(
     }
     statements.push(
       store.enqueue(
-        `update:${update.id}:reply:${index}`,
+        `update:${update.id}:${menuReply ? "menu" : "reply"}:${index}`,
         "reply",
         edit ? "editMessageText" : "sendMessage",
         {
@@ -159,23 +127,37 @@ export async function processUpdate(
   let callbackNotice = "Done";
   let action = "";
   let argument = "";
-  let requestedPage = 0;
+  let menuRange: ProductRange | undefined;
   let productId = 0;
   let callbackRevision: number | undefined;
+  let menuReply = false;
+
+  function showProducts(products: StoredProduct[], range?: ProductRange): void {
+    messages = productMenus(config, products, range);
+    menuReply = true;
+  }
 
   if (update.callback) {
     const data = update.callback.data;
     if (["products", "status", "check"].includes(data)) {
       action = data === "check" ? "checknow" : data;
     } else {
-      const page = data.match(/^page:(\d{1,10}):(\d{1,3})$/);
-      const selection = data.match(/^(track|untrack):(\d{1,10}):(\d{1,10}):(\d{1,3})$/);
+      const legacy = /^(?:page:\d{1,10}:\d{1,3}|(?:track|untrack):\d{1,10}:\d{1,10}:\d{1,3})$/.test(data);
+      const selection = data.match(/^pick:(\d{1,10}):(\d{1,10}):([01]):(\d{1,10}):(\d{1,10})$/);
       const pause = data.match(/^(pause|resume):(\d{1,10})$/);
-      if (page) {
-        action = "page"; callbackRevision = Number(page[1]); requestedPage = Number(page[2]);
+      if (legacy) {
+        action = "legacyMenu";
       } else if (selection) {
-        action = selection[1]!;
-        callbackRevision = Number(selection[2]); productId = Number(selection[3]); requestedPage = Number(selection[4]);
+        callbackRevision = Number(selection[1]);
+        productId = Number(selection[2]);
+        menuRange = { first: Number(selection[4]), last: Number(selection[5]) };
+        action = menuRange.first > 0 && menuRange.first <= productId && productId <= menuRange.last
+          ? selection[3] === "1" ? "track" : "untrack"
+          : "invalid";
+        if (action === "invalid") {
+          menuRange = undefined;
+          callbackRevision = undefined;
+        }
       } else if (pause) {
         action = pause[1]!; callbackRevision = Number(pause[2]);
       } else {
@@ -190,8 +172,8 @@ export async function processUpdate(
   }
 
   if (callbackRevision !== undefined && callbackRevision !== config.revision) {
-    callbackNotice = "This button is stale. Refreshed without changing your selections.";
-    messages = [productPage(config, await store.products(), requestedPage, callbackNotice)];
+    callbackNotice = "This button is stale. Refreshed without changing selections; tap again to choose.";
+    showProducts(await store.products(), menuRange);
   } else if (action === "help" || action === "start") {
     messages = [{ text: HELP }];
   } else if (action === "status") {
@@ -203,19 +185,23 @@ export async function processUpdate(
       // Catalog cache is idempotent; command effects/deduplication remain one later batch.
       await lease.commit(store.catalogPlan(catalog), config.revision);
       config = await store.config();
-      messages = [productPage(config, await store.products(), 0)];
+      showProducts(await store.products());
     } catch (error) {
       if (!(error instanceof SafeError)) throw error;
       statements.push(...upstreamFailure(store, error));
       messages = [{ text: `Catalog refresh failed: ${error.code}. No selections changed. Previous baselines are preserved; use /status and retry later.` }];
       callbackNotice = "Catalog unavailable; no selections changed.";
     }
-  } else if (action === "page") {
-    messages = [productPage(config, await store.products(), requestedPage)];
+  } else if (action === "legacyMenu") {
+    callbackNotice = "Menu upgraded. Selections unchanged; use the new full-name buttons.";
+    showProducts(await store.products());
   } else if (action === "track" || action === "untrack") {
     const products = await store.products();
     const product = products.find((item) => item.id === productId);
-    if (!product || (action === "track" && !product.active)) {
+    const pendingMenu = await store.pendingProductMenu(config.revision);
+    if (pendingMenu) {
+      callbackNotice = "The catalog is still arriving. Selection unchanged; tap again shortly.";
+    } else if (!product || (action === "track" && !product.active)) {
       callbackNotice = "Product is not in the current catalog. Refresh /products.";
     } else if ((action === "track") === Boolean(product.epoch)) {
       callbackNotice = "Selection already matches; nothing changed.";
@@ -236,7 +222,9 @@ export async function processUpdate(
       config = { ...config, revision: config.revision + 1 };
       callbackNotice = action === "track" ? "Tracked. First valid observation will be silent." : "Untracked. Pending alerts for this product cancelled.";
     }
-    messages = [productPage(config, products.filter((product) => product.active || product.epoch), requestedPage, callbackNotice)];
+    if (!pendingMenu) {
+      showProducts(products.filter((product) => product.active || product.epoch), menuRange);
+    }
   } else if (action === "pause" || action === "resume") {
     const paused = action === "pause" ? 1 : 0;
     if (config.paused !== paused) {
@@ -287,6 +275,6 @@ export async function processUpdate(
     messages = [{ text: "Unknown command or invalid arguments/button. Use /help. Nothing changed." }];
     callbackNotice = "Invalid command; nothing changed.";
   }
-  statements.push(...queueReplies(store, env, update, messages, callbackNotice, config.revision));
+  statements.push(...queueReplies(store, env, update, messages, callbackNotice, config.revision, menuReply));
   await lease.commit(statements, initial.revision);
 }
