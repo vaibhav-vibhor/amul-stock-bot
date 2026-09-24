@@ -334,9 +334,10 @@ describe("owner-only Telegram controls", () => {
     expect(upstream.telegram).toEqual([]);
   });
 
-  it("delivers the full representative catalog in one full-name selection menu", async () => {
+  it("sends one interactive 23-product list for a command and never duplicates it on webhook retry", async () => {
     upstream.products = proteinNames.map((name, index) => ({ ...fixtureProduct(index), name }));
-    expect((await webhook(command(1, "/products"))).status).toBe(200);
+    const request = command(1, "/products");
+    expect((await webhook(request)).status).toBe(200);
     const first = upstream.telegram[0]!.payload;
     expect(upstream.telegram).toHaveLength(1);
     expect(String(first.text)).toContain("Selected: 0/23");
@@ -344,6 +345,19 @@ describe("owner-only Telegram controls", () => {
     const menus = productMenus(await store.config(), await store.products());
     expect(menus).toHaveLength(1);
     expect(first).toMatchObject(menus[0]!);
+    expect(productButtons(upstream.telegram[0]!).map((button) => button.text))
+      .toEqual(proteinNames.map((name) => `\u2610 ${name.slice("Amul ".length)}`));
+    expect((await store.products()).map((product) => product.name)).toEqual(proteinNames);
+    for (const name of proteinNames) expect(first.text).not.toContain(name);
+    expect(String(first.text)).not.toMatch(/Match the numbers|Catalog:|Product IDs/);
+    const amulRequests = upstream.amul.length;
+    expect((await webhook(request)).status).toBe(200);
+    expect(upstream.telegram).toHaveLength(1);
+    expect(upstream.telegram[0]?.method).toBe("sendMessage");
+    expect(upstream.amul).toHaveLength(amulRequests);
+    expect((await store.sql(
+      "SELECT method, state, attempts FROM outbox WHERE dedupe_key LIKE 'update:1:menu:%'",
+    ).all()).results).toEqual([{ method: "sendMessage", state: "acknowledged", attempts: 1 }]);
     for (const row of menus[0]!.reply_markup!.inline_keyboard) {
       for (const button of row) {
         expect(button.url).toBeUndefined();
@@ -373,8 +387,9 @@ describe("owner-only Telegram controls", () => {
     expect(selected.method).toBe("editMessageText");
     expect(selected.payload.message_id).toBe(421);
     expect(selected.payload.text).toContain("Selected: 3/23");
+    expect(selected.payload.text).not.toContain(proteinNames[2]);
     expect(productButtons(selected)[2]).toMatchObject({
-      text: `\u2705 ${selectedProductId}. ${proteinNames[2]}`,
+      text: `\u2705 ${proteinNames[2]!.slice("Amul ".length)}`,
       style: "success",
       callback_data: `pick:2:${selectedProductId}:0:1:${lastProductId}`,
     });
@@ -386,7 +401,8 @@ describe("owner-only Telegram controls", () => {
     expect(deselected.payload.message_id).toBe(421);
     expect(deselected.payload.text).toContain("Selected: 2/23");
     expect(productButtons(deselected)[2]?.style).toBeUndefined();
-    expect(productButtons(deselected)[2]?.text).toBe(`\u2610 ${selectedProductId}. ${proteinNames[2]}`);
+    expect(productButtons(deselected)[2]?.text).toBe(`\u2610 ${proteinNames[2]!.slice("Amul ".length)}`);
+    expect((await store.products()).map((product) => product.name)).toEqual(proteinNames);
     expect((await store.products())[2]?.epoch).toBeNull();
     expect(await store.observations()).toEqual(baselines);
     expect(upstream.amul).toHaveLength(amulRequests);
@@ -399,7 +415,8 @@ describe("owner-only Telegram controls", () => {
     }));
     expect((await webhook(command(1, "/products"))).status).toBe(200);
     const originalMenus = [...upstream.telegram];
-    expect(originalMenus.length).toBeGreaterThan(6);
+    expect(originalMenus).toHaveLength(2);
+    expect(productButtons(originalMenus[0]!)).toHaveLength(97);
     expect(originalMenus.every((call) => call.method === "sendMessage")).toBe(true);
     expect(originalMenus.flatMap(productButtons).map((button) => Number(button.callback_data!.split(":")[2])))
       .toEqual(Array.from({ length: 100 }, (_, index) => index + 1));
@@ -435,7 +452,7 @@ describe("owner-only Telegram controls", () => {
     }));
     const budget = vi.spyOn(Network.prototype, "remaining").mockReturnValue(45_000);
     upstream.telegramResponse = () => {
-      if (upstream.telegram.length === 3) budget.mockReturnValue(0);
+      if (upstream.telegram.length === 1) budget.mockReturnValue(0);
       return Response.json({ ok: true, result: { message_id: upstream.telegram.length } });
     };
     const request = command(1, "/products");
@@ -443,7 +460,7 @@ describe("owner-only Telegram controls", () => {
     expect(response.status).toBe(503);
     expect(response.headers.get("Retry-After")).toBe("5");
     expect(await store.processed(1)).toBe(true);
-    expect(upstream.telegram).toHaveLength(3);
+    expect(upstream.telegram).toHaveLength(1);
     const amulRequests = upstream.amul.length;
     const selection = productButtons(upstream.telegram[0]!)[0]!.callback_data!;
     await webhook(callback(2, selection));
@@ -489,8 +506,36 @@ describe("owner-only Telegram controls", () => {
       expect(upstream.amul).toEqual([]);
       expect(upstream.telegram[0]?.payload.text).toContain("Menu upgraded");
       expect(productButtons(upstream.telegram.at(-1)!)).toHaveLength(23);
+      expect(upstream.telegram.at(-1)?.payload.text).not.toContain("Amul test protein");
     },
   );
+
+  it("edits an existing dual-list menu into buttons only using its unchanged pick callback", async () => {
+    await seedTracked(0, 23);
+    const old = callback(1, "pick:1:1:0:1:23", "existing-dual-list-menu", 734);
+    const update = {
+      ...old,
+      callback_query: {
+        ...old.callback_query,
+        message: {
+          ...old.callback_query.message,
+          text: "Protein products for PIN 500032\n1. Amul test protein 0\nMatch the numbers above...",
+        },
+      },
+    };
+    expect((await webhook(update)).status).toBe(200);
+    expect(upstream.telegram.map((call) => call.method)).toEqual(["answerCallbackQuery", "editMessageText"]);
+    const edited = upstream.telegram.at(-1)!;
+    expect(edited.payload.message_id).toBe(734);
+    expect(edited.payload.text).toBe("Protein products for PIN 500032\nSelected: 22/23\nTap a product to select or deselect.");
+    expect(productButtons(edited)).toHaveLength(23);
+    expect(productButtons(edited)[0]).toMatchObject({ text: "\u2610 test protein 0", callback_data: "pick:2:1:1:1:23" });
+    expect((await store.products())[0]?.epoch).toBeNull();
+    expect(await store.observations()).toHaveLength(22);
+    expect(upstream.amul).toEqual([]);
+    await webhook(update);
+    expect(upstream.telegram).toHaveLength(2);
+  });
 
   it("accepts a legitimate long Unicode menu echoed in a callback without relaxing owner authentication", async () => {
     upstream.products = Array.from({ length: 23 }, (_, index) => ({

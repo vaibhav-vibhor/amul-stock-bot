@@ -30,6 +30,9 @@ function assertBounds(messages: Message[]): void {
     expect(message.text.length).toBeGreaterThan(0);
     expect(message.text.length).toBeLessThanOrEqual(4_096);
     expect(new TextDecoder().decode(new TextEncoder().encode(message.text))).toBe(message.text);
+    const escapedResponse = JSON.stringify({ ok: true, result: { message_id: 1, ...message } })
+      .replace(/[^\x00-\x7f]/g, "\\u0000");
+    expect(escapedResponse.length).toBeLessThan(64_000);
     const buttons = message.reply_markup!.inline_keyboard.flat();
     expect(buttons.length).toBeLessThanOrEqual(100);
     for (const button of buttons) {
@@ -41,7 +44,7 @@ function assertBounds(messages: Message[]): void {
 }
 
 describe("complete product selection menus", () => {
-  it("renders the actual 23-name catalog exactly once in one menu without links or paging", () => {
+  it("renders the actual 23-name catalog only once as clickable buttons under a compact header", () => {
     const catalog = products();
     catalog[2]!.epoch = "watch-chocolate";
     catalog[21]!.epoch = "watch-milk";
@@ -49,16 +52,13 @@ describe("complete product selection menus", () => {
     expect(messages).toHaveLength(1);
     assertBounds(messages);
     const text = messages[0]!.text;
-    expect(text).toContain("Selected: 2/23");
-    expect(text).toContain("\u2705 Selected | \u2610 Not selected");
+    expect(text).toBe("Protein products for PIN 500032\nSelected: 2/23\nTap a product to select or deselect.");
     const buttons = toggles(messages);
     expect(buttons).toHaveLength(23);
     catalog.forEach((product, index) => {
-      expect(text.split("\n").filter((entry) =>
-        entry === `${product.epoch ? "\u2705" : "\u2610"} ${product.id}. ${product.name}`,
-      )).toHaveLength(1);
-      expect(text).toContain(`${product.id}. ${product.name}`);
-      expect(buttons[index]!.text).toBe(`${product.epoch ? "\u2705" : "\u2610"} ${product.id}. ${product.name}`);
+      expect(text).not.toContain(product.name);
+      expect(buttons[index]!.text).toBe(`${product.epoch ? "\u2705" : "\u2610"} ${product.name.slice("Amul ".length)}`);
+      expect(buttons.filter((button) => button.text === buttons[index]!.text)).toHaveLength(1);
       expect(buttons[index]!.style).toBe(product.epoch ? "success" : undefined);
     });
     expect(messages[0]!.reply_markup!.inline_keyboard.at(-1)?.map((button) => button.text))
@@ -69,35 +69,65 @@ describe("complete product selection menus", () => {
     const name = 'Protein <Milk> & "Kesar" / \u{1F95B} \u0932\u0938\u094d\u0938\u0940 _500g_ *pack*';
     const messages = productMenus(config, products([name]));
     assertBounds(messages);
-    expect(messages[0]!.text).toContain(name);
-    expect(toggles(messages)[0]!.text).toBe(`\u2610 1. ${name}`);
+    expect(messages[0]!.text).not.toContain(name);
+    expect(toggles(messages)[0]!.text).toBe(`\u2610 ${name}`);
     expect(messages[0]).not.toHaveProperty("parse_mode");
   });
 
-  it("splits only overflowing full text into consecutive chunks and preserves order and stable IDs", () => {
+  it.each([
+    ["Amul Chocolate Whey Protein Gift Pack, 34 g | Pack of 10 sachets", "Chocolate Whey Protein Gift Pack, 34 g | Pack of 10 sachets"],
+    ["amul Kool Milkshake | Kesar, 180 mL | Pack of 30", "Kool Milkshake | Kesar, 180 mL | Pack of 30"],
+    [" \tAMUL \t High Protein Milk, 250 mL | Pack of 8", "High Protein Milk, 250 mL | Pack of 8"],
+    ["Amul\u00a0\u00a0Protein \u0932\u0938\u094d\u0938\u0940", "Protein \u0932\u0938\u094d\u0938\u0940"],
+    ["Amulya Milk Powder, 1 kg", "Amulya Milk Powder, 1 kg"],
+    ["Gift pack by Amul, 34 g", "Gift pack by Amul, 34 g"],
+    ["Amul-Protein Pack", "Amul-Protein Pack"],
+    ["Amul", "Amul"],
+    ["Whey Protein, 34 g | Pack of 30", "Whey Protein, 34 g | Pack of 30"],
+  ])("removes only the leading standalone brand from %s for display", (canonicalName, displayedName) => {
+    const catalog = products([canonicalName]);
+    const before = structuredClone(catalog);
+    const button = toggles(productMenus(config, catalog))[0]!;
+    expect(button.text).toBe(`\u2610 ${displayedName}`);
+    expect(button.callback_data).toBe("pick:1:1:1:1:1");
+    expect(catalog).toEqual(before);
+  });
+
+  it("keeps long names in one keyboard even when a duplicated text list would have overflowed", () => {
+    const catalog = products(Array.from({ length: 23 }, (_, index) =>
+      `Product ${index} ` + "X".repeat(280),
+    ));
+    expect(catalog.map((product) => product.name).join("\n").length).toBeGreaterThan(4_096);
+    const messages = productMenus(config, catalog);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]!.text.length).toBeLessThan(150);
+    expect(toggles(messages).map((button) => button.text)).toEqual(catalog.map((product) => `\u2610 ${product.name}`));
+    assertBounds(messages);
+  });
+
+  it("splits only oversized keyboards and preserves every product once in order with stable IDs", () => {
     const catalog = products(Array.from({ length: 200 }, (_, index) =>
       `${index} ` + "Long & <full> \u{1F95B} product ".repeat(11),
     ));
     catalog[40]!.epoch = "selected";
     const messages = productMenus(config, catalog);
-    expect(messages.length).toBeGreaterThan(6);
+    expect(messages.length).toBeGreaterThan(1);
     assertBounds(messages);
     const buttons = toggles(messages);
     expect(buttons).toHaveLength(200);
     expect(buttons.map((button) => Number(button.callback_data!.split(":")[2])))
       .toEqual(catalog.map((product) => product.id));
     const text = messages.map((message) => message.text).join("\n");
-    for (const product of catalog) {
-      expect(text.split("\n").filter((entry) =>
-        entry === `${product.epoch ? "\u2705" : "\u2610"} ${product.id}. ${product.name}`,
-      )).toHaveLength(1);
+    for (const [index, product] of catalog.entries()) {
+      expect(text).not.toContain(product.name);
+      expect(buttons[index]!.text).toBe(`${product.epoch ? "\u2705" : "\u2610"} ${product.name}`);
     }
     expect(messages.every((message) => message.text.includes("Selected in this message:"))).toBe(true);
-    expect(messages.every((message) => message.text.includes("/status shows the current overall count."))).toBe(true);
+    expect(messages.every((message) => message.text.includes("/status shows the overall count."))).toBe(true);
     expect(messages.every((message) => !message.text.includes("\nSelected:"))).toBe(true);
   });
 
-  it("splits at the button budget even when tiny names fit in the text limit", () => {
+  it("splits at the button budget, reserving three controls per keyboard", () => {
     const catalog = products(Array.from({ length: 100 }, (_, index) => `P${index}`));
     const messages = productMenus(config, catalog);
     expect(messages).toHaveLength(2);
@@ -106,8 +136,16 @@ describe("complete product selection menus", () => {
     expect(toggles(messages)).toHaveLength(100);
   });
 
+  it("bounds echoed keyboard bytes for maximum-length Unicode names without shortening any name", () => {
+    const catalog = products(Array.from({ length: 97 }, (_, index) => `${index} ` + "\u4e73".repeat(290)));
+    const messages = productMenus(config, catalog);
+    expect(messages.length).toBeGreaterThan(1);
+    expect(toggles(messages).map((button) => button.text)).toEqual(catalog.map((product) => `\u2610 ${product.name}`));
+    assertBounds(messages);
+  });
+
   it("keeps range callbacks and boundaries stable when selection counts grow", () => {
-    const catalog = products(Array.from({ length: 35 }, (_, index) => `${index} ` + "X".repeat(280)));
+    const catalog = products(Array.from({ length: 100 }, (_, index) => `${index} ` + "X".repeat(280)));
     const initial = productMenus(config, catalog);
     catalog.forEach((product) => { product.epoch = `watch-${product.id}`; });
     const selected = productMenus({ ...config, revision: 36 }, catalog);
@@ -120,13 +158,14 @@ describe("complete product selection menus", () => {
     expect(updatedChunk[0]!.text).toContain("Selected in this message:");
   });
 
-  it("uses nonsequential persistent IDs without renumbering or changing the input order", () => {
+  it("keeps nonsequential persistent IDs internal without numbering the visible labels", () => {
     const catalog = products(proteinNames.slice(0, 3));
     catalog[0]!.id = 4;
     catalog[1]!.id = 19;
     catalog[2]!.id = 42;
-    expect(toggles(productMenus(config, catalog)).map((button) => button.text))
-      .toEqual(catalog.map((product) => `\u2610 ${product.id}. ${product.name}`));
+    const buttons = toggles(productMenus(config, catalog));
+    expect(buttons.map((button) => button.text)).toEqual(catalog.map((product) => `\u2610 ${product.name.slice("Amul ".length)}`));
+    expect(buttons.map((button) => Number(button.callback_data!.split(":")[2]))).toEqual([4, 19, 42]);
   });
 
   it("keeps missing tracked products removable and handles an empty chunk without hiding controls", () => {
@@ -134,8 +173,12 @@ describe("complete product selection menus", () => {
     catalog[0]!.active = 0;
     catalog[0]!.epoch = "watch";
     const menu = productMenus(config, catalog)[0]!;
-    expect(menu.text).toContain("UNKNOWN");
-    expect(toggles([menu])[0]).toMatchObject({ style: "success", callback_data: "pick:1:1:0:1:1" });
+    expect(menu.text).not.toContain(catalog[0]!.name);
+    expect(toggles([menu])[0]).toMatchObject({
+      text: `\u2705 ${catalog[0]!.name.slice("Amul ".length)} [UNKNOWN]`,
+      style: "success",
+      callback_data: "pick:1:1:0:1:1",
+    });
     const empty = productMenus({ ...config, paused: 1 }, [], { first: 1, last: 1 });
     expect(empty[0]!.text).toContain("No products remain");
     expect(empty[0]!.reply_markup!.inline_keyboard[0]![0]!.text).toBe("Resume");
