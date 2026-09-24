@@ -2,7 +2,7 @@ import { Amul, productUrl } from "./amul";
 import type { Store } from "./db";
 import { errorCode, logFailure, SafeError } from "./errors";
 import type { Network } from "./http";
-import type { Catalog, Config, Env, Message } from "./types";
+import type { Catalog, Config, Env, Message, Product } from "./types";
 
 export interface CheckPlan {
   statements: D1PreparedStatement[];
@@ -31,17 +31,80 @@ export function upstreamFailure(store: Store, error: SafeError): D1PreparedState
   ];
 }
 
-export function splitMessages(header: string, lines: string[]): Message[] {
+const snapshotDate = new Intl.DateTimeFormat("en-US", {
+  timeZone: "Asia/Kolkata",
+  day: "2-digit", month: "short", year: "numeric",
+  hour: "2-digit", minute: "2-digit", hour12: true,
+});
+
+function html(text: string): string {
+  return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+export function snapshotMessages(
+  pincode: string,
+  checkedAt: number,
+  products: Pick<Product, "name" | "available">[],
+  paused: boolean,
+): Message[] {
+  const available = products.filter((product) => product.available === 1);
+  const unavailable = products.filter((product) => product.available === 0);
+  const unknown = products.filter((product) => product.available === null);
+  const parts = snapshotDate.formatToParts(checkedAt);
+  const part = (type: Intl.DateTimeFormatPartTypes): string =>
+    parts.find((entry) => entry.type === type)!.value;
+  const checked = `${part("day")} ${part("month")} ${part("year")}, ${part("hour")}:${part("minute")} ${part("dayPeriod").toUpperCase()} IST`;
+  const title = `Stock snapshot \u2014 PIN ${pincode}`;
+  const details = `\nChecked: ${checked}${paused ? "\nPaused: this snapshot does not change alert baselines." : ""}${unknown.length ? "\nPartial check: some products are UNKNOWN." : ""}`;
+  const none = available.length ? "" : unknown.length
+    ? "No selected products are confirmed available."
+    : "No selected products are available.";
+  const header = `<b>${html(title)}</b>${html(details)}${none ? `\n\n<b>${none}</b>` : ""}`;
+  const headerLength = title.length + details.length + (none ? none.length + 2 : 0);
+  const footer = "\n\nNot reserved or guaranteed at checkout.";
+  const groups = [
+    { label: "\u2705 Available", products: available, note: "" },
+    { label: "\u274c Out of stock", products: unavailable, note: "" },
+    {
+      label: "\u26a0\ufe0f Unconfirmed",
+      products: unknown,
+      note: "\nUNKNOWN: missing or unrecognized availability; previous baselines preserved.",
+    },
+  ];
   const messages: Message[] = [];
   let text = header;
-  for (const line of lines) {
-    if (text.length + line.length + 2 > 3_900) {
-      messages.push({ text });
-      text = `${header} (continued)`;
+  let length = headerLength;
+  let itemsInMessage = 0;
+  for (const group of groups) {
+    const prefix = (continued: boolean) => {
+      const label = `${group.label} (${group.products.length})${continued ? " (continued)" : ""}`;
+      return {
+        text: `\n\n<b>${label}</b>${group.note}\n`,
+        length: label.length + group.note.length + 3,
+      };
+    };
+    for (const [index, product] of group.products.entries()) {
+      const bullet = `\u2022 ${product.name}`;
+      let before = index === 0 ? prefix(false) : { text: "\n", length: 1 };
+      // Telegram limits text after entity parsing. Count the original UTF-16
+      // text, not expanded HTML entities, and never cut a name or entity.
+      if (length + before.length + bullet.length + footer.length > 4_096) {
+        if (!itemsInMessage) throw new SafeError("snapshot_product_name_too_long");
+        messages.push({ text, parse_mode: "HTML" });
+        text = `${header}\n(continued)`;
+        length = headerLength + "\n(continued)".length;
+        itemsInMessage = 0;
+        before = prefix(index > 0);
+      }
+      if (length + before.length + bullet.length + footer.length > 4_096) {
+        throw new SafeError("snapshot_product_name_too_long");
+      }
+      text += before.text + html(bullet);
+      length += before.length + bullet.length;
+      itemsInMessage++;
     }
-    text += `\n\n${line}`;
   }
-  messages.push({ text });
+  messages.push({ text: text + footer, parse_mode: "HTML" });
   return messages;
 }
 
@@ -75,15 +138,13 @@ export async function planCheck(
       .map((observation) => [observation.product_id, observation]),
   );
   const statements = store.catalogPlan(catalog);
-  const lines: string[] = [];
+  const snapshot: Pick<Product, "name" | "available">[] = [];
   let unknown = 0;
 
   for (const trackedProduct of tracked) {
     const product = products.get(trackedProduct.alias);
     const available = product?.available ?? null;
-    lines.push(
-      `${trackedProduct.name}\n${available === null ? "UNKNOWN (missing or unrecognized availability; baseline preserved)" : available === 1 ? "Available" : "Out of stock"}`,
-    );
+    snapshot.push({ name: trackedProduct.name, available });
     if (available === null) {
       unknown++;
       continue;
@@ -148,6 +209,5 @@ export async function planCheck(
     ),
   );
   if (unknown) logFailure("amul_check", new SafeError(`amul_unknown_availability:${unknown}`));
-  const header = `Requested stock snapshot for PIN ${config.pincode}\n${new Date(catalog.checkedAt).toISOString()}${config.paused ? "\nPaused: this snapshot does not change alert baselines." : ""}${unknown ? "\nPARTIAL CHECK: some products are UNKNOWN." : ""}\nNot reserved or guaranteed at checkout.`;
-  return { statements, messages: splitMessages(header, lines) };
+  return { statements, messages: snapshotMessages(config.pincode, catalog.checkedAt, snapshot, Boolean(config.paused)) };
 }

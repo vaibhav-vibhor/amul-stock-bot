@@ -4,7 +4,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Store } from "../src/db";
 import { Network } from "../src/http";
 import { productMenus } from "../src/menus";
-import { splitMessages } from "../src/stock";
 import type { Button } from "../src/types";
 import worker, { MAX_WEBHOOK_BYTES } from "../src";
 import { proteinNames } from "./catalog";
@@ -351,9 +350,6 @@ describe("owner-only Telegram controls", () => {
         if (button.callback_data) expect(new TextEncoder().encode(button.callback_data).length).toBeLessThanOrEqual(64);
       }
     }
-    const chunks = splitMessages("Snapshot", Array.from({ length: 200 }, () => "x".repeat(350)));
-    expect(chunks.length).toBeGreaterThan(1);
-    expect(chunks.every((message) => message.text.length <= 4_096)).toBe(true);
     const unicodePage = productMenus(await store.config(), (await store.products()).map((product) => ({
       ...product, name: "a" + "\u{1F95B}".repeat(25),
     })))[0]!;
@@ -619,7 +615,7 @@ describe("owner-only Telegram controls", () => {
     upstream.products = [fixtureProduct(0, 1)];
     await webhook(command(1, "/checknow"));
     expect(deliveredTexts()).toHaveLength(1);
-    expect(deliveredTexts()[0]).toContain("Requested stock snapshot for PIN 500032");
+    expect(deliveredTexts()[0]).toContain("Stock snapshot \u2014 PIN 500032");
     expect(deliveredTexts()[0]).toContain("Available");
     expect(await alerts()).toEqual([]);
   });

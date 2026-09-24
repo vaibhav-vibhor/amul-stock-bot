@@ -61,6 +61,7 @@ export interface Button {
 
 export interface Message {
   text: string;
+  parse_mode?: "HTML";
   reply_markup?: { inline_keyboard: Button[][] };
 }
 
