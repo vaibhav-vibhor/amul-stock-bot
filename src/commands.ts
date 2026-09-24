@@ -6,18 +6,21 @@ import { productMenus } from "./menus";
 import type { ProductRange } from "./menus";
 import { assertUpstreamReady, planCheck, upstreamFailure } from "./stock";
 import type { Config, Env, Message, OwnerUpdate, StoredProduct } from "./types";
+import { CHECK_INTERVAL_MS } from "./background";
 
-const HELP = `Amul protein restock bot (private owner only)
+const HELP = `Amul protein availability bot (private owner only)
 
 /products - all products; tap full-name buttons to select/unselect
 /pincode 500032 - validate and change the delivery PIN
 /status - configuration, last successful check and errors
 /checknow - request a current stock snapshot
-/pause - stop checks/alerts and discard pending restock alerts
-/resume - resume with new silent baselines
+/pause - stop background checks/reminders
+/resume - restore reminders on the five-minute cadence
 /help - these instructions
 
-Initially nothing is tracked. The first valid observation after tracking, changing PIN or resuming is silent, even if in stock. An observed out-of-stock -> available transition sends one alert, then re-arms only after another observed stock-out. Errors are UNKNOWN, never stock-outs.
+When enabled, Cloudflare checks selected products every five minutes, even with your laptop off. Each check with confirmed availability sends one consolidated reminder, including the first check and unchanged in-stock products. No available selections means no reminder. Unknowns/errors are never assumed available.
+
+/checknow is an optional immediate snapshot, not required for monitoring, and never generates a periodic reminder. /status shows the last actual background check; selecting products does not prove the schedule is active.
 
 Availability is a snapshot, not a reservation. Short restocks between polls may be missed.`;
 
@@ -25,8 +28,22 @@ function time(value: number | null): string {
   return value === null ? "never (awaiting a complete successful check)" : new Date(value).toISOString();
 }
 
-async function status(store: Store, config: Config): Promise<Message> {
+async function status(store: Store, config: Config, monitoringEnabled: boolean): Promise<Message> {
   const products = await store.products();
+  const background = await store.lastBackgroundCycle();
+  const backgroundSuccess = await store.sql(
+    `SELECT completed_at FROM background_cycles
+     WHERE outcome IN ('available', 'unavailable') AND pincode = ? AND config_revision = ?
+     ORDER BY scheduled_at DESC LIMIT 1`,
+    config.pincode, config.revision,
+  ).first<{ completed_at: number }>();
+  const monitoring = config.paused ? "PAUSED"
+    : !monitoringEnabled ? "BACKGROUND DISABLED IN WORKER CONFIGURATION"
+    : !products.some((product) => product.epoch) ? "NO PRODUCTS SELECTED"
+    : !background ? "WAITING FOR FIRST BACKGROUND CHECK (schedule not yet observed)"
+    : Date.now() - background.scheduled_at > 2 * CHECK_INTERVAL_MS ? "BACKGROUND CHECK OVERDUE (verify Cloudflare cron)"
+    : background.config_revision !== config.revision ? "WAITING FOR BACKGROUND CHECK OF CURRENT SELECTIONS/PIN"
+    : `BACKGROUND CHECK OBSERVED: ${background.outcome}`;
   const pending = await store.sql(
     "SELECT COUNT(*) AS count FROM outbox WHERE state = 'pending'",
   ).first<{ count: number }>();
@@ -34,7 +51,7 @@ async function status(store: Store, config: Config): Promise<Message> {
     "SELECT last_error FROM outbox WHERE state = 'pending' AND last_error IS NOT NULL ORDER BY id DESC LIMIT 1",
   ).first<{ last_error: string }>();
   return {
-    text: `Amul bot: ${config.paused ? "PAUSED" : "ready"}\nPIN: ${config.pincode}\nTracked products: ${products.filter((product) => product.epoch).length}\nLast successful complete check: ${time(config.last_success_at)}\nLast check attempt: ${time(config.last_attempt_at)}\nLast check error: ${config.last_error ?? "none"}\nUpstream retry not before: ${config.upstream_retry_at > Date.now() ? time(config.upstream_retry_at) : "not throttled"}\nPending deliveries: ${pending?.count ?? 0}\nDelivery error: ${deliveryError?.last_error ?? "none"}\nSchedule: configured Cloudflare cron (five minutes by default).\nNo selected products means no scheduled inventory requests or alerts.`,
+    text: `Amul bot: ${monitoring}\nPIN: ${config.pincode}\nTracked products: ${products.filter((product) => product.epoch).length}\nLast successful background check (current settings): ${time(backgroundSuccess?.completed_at ?? null)}\nLast scheduled cycle: ${time(background?.scheduled_at ?? null)}\nBackground outcome/error: ${background?.outcome ?? "not observed"} / ${background?.error ?? "none"}\nLast successful complete check (manual or background): ${time(config.last_success_at)}\nLast check attempt: ${time(config.last_attempt_at)}\nLast check error: ${config.last_error ?? "none"}\nUpstream retry not before: ${config.upstream_retry_at > Date.now() ? time(config.upstream_retry_at) : "not throttled"}\nPending deliveries: ${pending?.count ?? 0}\nDelivery error: ${deliveryError?.last_error ?? "none"}\nSchedule: every five minutes on Cloudflare; laptop not required.\nOne reminder per cycle with available selections, even if unchanged. /checknow is optional.`,
     reply_markup: {
       inline_keyboard: [[
         { text: "Products", callback_data: "products" },
@@ -177,7 +194,7 @@ export async function processUpdate(
   } else if (action === "help" || action === "start") {
     messages = [{ text: HELP }];
   } else if (action === "status") {
-    messages = [await status(store, config)];
+    messages = [await status(store, config, env.MONITORING_ENABLED === "true")];
   } else if (action === "products") {
     try {
       assertUpstreamReady(config);
@@ -213,14 +230,13 @@ export async function processUpdate(
           : store.sql("DELETE FROM tracked_products WHERE product_id = ?", product.id),
         store.sql("DELETE FROM observations WHERE product_id = ?", product.id),
         store.sql(
-          "UPDATE outbox SET state = 'cancelled', last_error = 'selection_changed' WHERE kind = 'alert' AND state = 'pending' AND product_id = ?",
-          product.id,
+          "UPDATE outbox SET state = 'cancelled', last_error = 'selection_changed' WHERE kind = 'alert' AND state = 'pending'",
         ),
         store.sql("UPDATE config SET revision = revision + 1, last_success_at = NULL, last_error = NULL WHERE id = 1"),
       );
       product.epoch = epoch;
       config = { ...config, revision: config.revision + 1 };
-      callbackNotice = action === "track" ? "Tracked. First valid observation will be silent." : "Untracked. Pending alerts for this product cancelled.";
+      callbackNotice = action === "track" ? "Selected. Available stock will be included from the next background check." : "Unselected. Pending reminder cancelled; the next check uses your updated selection.";
     }
     if (!pendingMenu) {
       showProducts(products.filter((product) => product.active || product.epoch), menuRange);
@@ -238,8 +254,10 @@ export async function processUpdate(
       config = { ...config, paused, revision: config.revision + 1 };
     }
     callbackNotice = paused
-      ? "Paused. Pending restock alerts cancelled."
-      : "Resumed. First valid observations will be silent.";
+      ? "Paused. Background checks stopped and pending reminders cancelled."
+      : env.MONITORING_ENABLED !== "true"
+      ? "Owner pause cleared, but background monitoring is disabled in the Worker configuration. See /status."
+      : "Resumed. Available selections will be included from the next five-minute check.";
     messages = [{ text: callbackNotice }];
   } else if (action === "pincode") {
     if (!validPincode(argument)) {
@@ -260,7 +278,7 @@ export async function processUpdate(
           store.sql("UPDATE products SET active = 0, catalog_available = NULL"),
         );
         config = { ...config, pincode: argument, revision: config.revision + 1 };
-        messages = [{ text: `Delivery PIN changed to ${argument}. Existing selections are retained, but their first valid observations for this PIN will be silent. Pending old-PIN alerts were cancelled. Use /products to refresh the regional catalog.` }];
+        messages = [{ text: `Delivery PIN changed to ${argument}. Existing selections are retained; available products will be included from the next background check for this PIN. Pending old-PIN reminders were cancelled. Use /products to refresh the regional catalog.` }];
       } catch (error) {
         if (!(error instanceof SafeError)) throw error;
         statements.push(...upstreamFailure(store, error));
@@ -268,7 +286,7 @@ export async function processUpdate(
       }
     }
   } else if (action === "checknow") {
-    const plan = await planCheck(store, config, env, network);
+    const plan = await planCheck(store, config, network);
     statements.push(...plan.statements);
     messages = plan.messages;
   } else {

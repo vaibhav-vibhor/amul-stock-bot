@@ -1,8 +1,12 @@
+import type { PersonalMonitor } from "./monitor";
+
 export interface Env {
+  MONITOR: DurableObjectNamespace<PersonalMonitor>;
   DB: D1Database;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_WEBHOOK_SECRET: string;
   TELEGRAM_OWNER_ID: string;
+  MONITORING_ENABLED: string;
 }
 
 export type Availability = 0 | 1;
@@ -50,6 +54,19 @@ export interface Observation {
   available: Availability;
   checked_at: number;
   transition_seq: number;
+}
+
+export interface BackgroundCycle {
+  scheduled_at: number;
+  started_at: number;
+  completed_at: number | null;
+  pincode: string;
+  config_revision: number;
+  outcome: "checking" | "available" | "unavailable" | "partial" | "error" | "paused" | "empty" | "expired";
+  selected_count: number;
+  available_count: number;
+  unknown_count: number;
+  error: string | null;
 }
 
 export interface Button {

@@ -44,6 +44,50 @@ describe("regional Amul protocol", () => {
       .map((call) => call.url.searchParams.get("start"))).toEqual(["0", "50"]);
   });
 
+  it("filters watched aliases without field projection and preserves full-response availability answers", async () => {
+    const upstream = new Upstream();
+    upstream.products = [fixtureProduct(0, 1), fixtureProduct(1, 0), fixtureProduct(2, 1)];
+    upstream.install();
+    const full = await new Amul(new Network()).catalog("500032");
+    const selected = [full.products[0]!.alias, full.products[1]!.alias];
+    const filtered = await new Amul(new Network()).catalog("500032", selected);
+    expect(filtered.products).toEqual(full.products.filter((product) => selected.includes(product.alias)));
+    const inventory = upstream.amul.filter((call) => call.url.pathname === "/entity/ms.products").at(-1)!;
+    expect(JSON.parse(inventory.url.searchParams.get("filters")!)).toEqual([
+      { field: "categories", value: ["protein"], operator: "in" },
+      { field: "alias", value: selected, operator: "in" },
+    ]);
+    expect([...inventory.url.searchParams.keys()].some((key) => key.startsWith("fields"))).toBe(false);
+  });
+
+  it("permits zero filtered matches as missing/UNKNOWN rather than inventing default availability", async () => {
+    const upstream = new Upstream();
+    upstream.install();
+    expect((await new Amul(new Network()).catalog("500032", ["amul-missing-protein"])).products).toEqual([]);
+  });
+
+  it("fails closed when the upstream ignores the exact alias filter", async () => {
+    const upstream = new Upstream();
+    upstream.products = [fixtureProduct(0, 1), fixtureProduct(1, 0)];
+    upstream.ignoreAliasFilter = true;
+    upstream.install();
+    await expect(new Amul(new Network()).catalog("500032", ["amul-test-protein-0"]))
+      .rejects.toThrow("amul_filtered_unexpected_product");
+  });
+
+  it.each([
+    { aliases: [] }, { aliases: ["../unsafe"] },
+    { aliases: ["amul-test-protein-0", "amul-test-protein-0"] },
+  ])(
+    "rejects invalid watched-alias filters %s before requesting a guest session",
+    async ({ aliases }) => {
+      const upstream = new Upstream();
+      upstream.install();
+      await expect(new Amul(new Network()).catalog("500032", aliases)).rejects.toThrow("amul_invalid_alias_filter");
+      expect(upstream.amul).toEqual([]);
+    },
+  );
+
   it("requires an empty terminal page when the page size divides the catalog", async () => {
     const upstream = new Upstream();
     upstream.products = Array.from({ length: 50 }, (_, index) => fixtureProduct(index));

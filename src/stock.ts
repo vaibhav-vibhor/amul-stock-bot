@@ -2,11 +2,16 @@ import { Amul, productUrl } from "./amul";
 import type { Store } from "./db";
 import { errorCode, logFailure, SafeError } from "./errors";
 import type { Network } from "./http";
-import type { Catalog, Config, Env, Message, Product } from "./types";
+import type { Catalog, Config, Message, Product, StoredProduct } from "./types";
 
 export interface CheckPlan {
   statements: D1PreparedStatement[];
   messages: Message[];
+  snapshot: Product[];
+  selectedCount: number;
+  unknownCount: number;
+  checkedAt: number | null;
+  error: string | null;
 }
 
 export function assertUpstreamReady(config: Config): void {
@@ -37,8 +42,15 @@ const snapshotDate = new Intl.DateTimeFormat("en-US", {
   hour: "2-digit", minute: "2-digit", hour12: true,
 });
 
-function html(text: string): string {
+export function html(text: string): string {
   return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+export function checkedTime(checkedAt: number): string {
+  const parts = snapshotDate.formatToParts(checkedAt);
+  const part = (type: Intl.DateTimeFormatPartTypes): string =>
+    parts.find((entry) => entry.type === type)!.value;
+  return `${part("day")} ${part("month")} ${part("year")}, ${part("hour")}:${part("minute")} ${part("dayPeriod").toUpperCase()} IST`;
 }
 
 export function snapshotMessages(
@@ -50,10 +62,7 @@ export function snapshotMessages(
   const available = products.filter((product) => product.available === 1);
   const unavailable = products.filter((product) => product.available === 0);
   const unknown = products.filter((product) => product.available === null);
-  const parts = snapshotDate.formatToParts(checkedAt);
-  const part = (type: Intl.DateTimeFormatPartTypes): string =>
-    parts.find((entry) => entry.type === type)!.value;
-  const checked = `${part("day")} ${part("month")} ${part("year")}, ${part("hour")}:${part("minute")} ${part("dayPeriod").toUpperCase()} IST`;
+  const checked = checkedTime(checkedAt);
   const title = `Stock snapshot \u2014 PIN ${pincode}`;
   const details = `\nChecked: ${checked}${paused ? "\nPaused: this snapshot does not change alert baselines." : ""}${unknown.length ? "\nPartial check: some products are UNKNOWN." : ""}`;
   const none = available.length ? "" : unknown.length
@@ -111,96 +120,70 @@ export function snapshotMessages(
 export async function planCheck(
   store: Store,
   config: Config,
-  env: Env,
   network: Network,
+  includeSnapshot = true,
+  knownProducts?: StoredProduct[],
 ): Promise<CheckPlan> {
-  const tracked = (await store.products()).filter((product) => product.epoch !== null);
+  const tracked = (knownProducts ?? await store.products()).filter((product) => product.epoch !== null);
+  const invalidatePriorReminder = includeSnapshot ? [
+    store.sql("UPDATE outbox SET state = 'cancelled', last_error = 'manual_recheck' WHERE kind = 'alert' AND state = 'pending'"),
+  ] : [];
   if (!tracked.length) {
-    return { statements: [], messages: [{ text: "No products tracked. Use /products to choose some. Nothing is being monitored." }] };
+    return {
+      statements: invalidatePriorReminder, messages: [{ text: "No products tracked. Use /products to choose some. Nothing is being monitored." }],
+      snapshot: [], selectedCount: 0, unknownCount: 0, checkedAt: null, error: null,
+    };
   }
   let catalog: Catalog;
   try {
     assertUpstreamReady(config);
-    catalog = await new Amul(network).catalog(config.pincode);
+    catalog = await new Amul(network).catalog(
+      config.pincode, includeSnapshot ? undefined : tracked.map((product) => product.alias),
+    );
   } catch (error) {
     if (!(error instanceof SafeError)) throw error;
     return {
-      statements: upstreamFailure(store, error),
+      statements: [...invalidatePriorReminder, ...upstreamFailure(store, error)],
       messages: [{
         text: `Check failed for PIN ${config.pincode}: ${error.code}.\nNo stock status was inferred; previous valid baselines are preserved. Try again later or inspect /status.`,
       }],
+      snapshot: [], selectedCount: tracked.length, unknownCount: tracked.length, checkedAt: null, error: error.code,
     };
   }
   const products = new Map(catalog.products.map((product) => [product.alias, product]));
-  const observations = new Map(
-    (await store.observations())
-      .filter((observation) => observation.pincode === config.pincode)
-      .map((observation) => [observation.product_id, observation]),
-  );
-  const statements = store.catalogPlan(catalog);
-  const snapshot: Pick<Product, "name" | "available">[] = [];
+  // The selection UI owns the catalog cache. Periodic checks only persist
+  // watched observations, avoiding a full catalog rewrite every five minutes.
+  const statements = [...invalidatePriorReminder, ...(includeSnapshot ? store.catalogPlan(catalog) : [])];
+  const snapshot: Product[] = [];
   let unknown = 0;
 
   for (const trackedProduct of tracked) {
     const product = products.get(trackedProduct.alias);
     const available = product?.available ?? null;
-    snapshot.push({ name: trackedProduct.name, available });
+    snapshot.push({ name: product?.name ?? trackedProduct.name, alias: trackedProduct.alias, available });
     if (available === null) {
       unknown++;
       continue;
     }
     if (config.paused) continue;
-    const previous = observations.get(trackedProduct.id);
-    const baseline = previous?.watch_epoch === trackedProduct.epoch ? previous : undefined;
-    const restock = baseline?.available === 0 && available === 1;
-    const sequence = (baseline?.transition_seq ?? 0) + (restock ? 1 : 0);
     statements.push(
       store.sql(
         `INSERT INTO observations
-         (product_id, pincode, watch_epoch, available, checked_at, transition_seq)
-         VALUES (?, ?, ?, ?, ?, ?)
+         (product_id, pincode, watch_epoch, available, checked_at)
+         VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(product_id, pincode, watch_epoch) DO UPDATE SET
-           available = excluded.available, checked_at = excluded.checked_at,
-           transition_seq = excluded.transition_seq`,
+           available = excluded.available, checked_at = excluded.checked_at`,
         trackedProduct.id,
         config.pincode,
         trackedProduct.epoch,
         available,
         catalog.checkedAt,
-        sequence,
       ),
     );
-    if (available === 0) {
-      statements.push(
-        store.sql(
-          `UPDATE outbox SET state = 'cancelled', last_error = 'stock_out_again'
-           WHERE kind = 'alert' AND state = 'pending' AND product_id = ?
-             AND pincode = ? AND watch_epoch = ?`,
-          trackedProduct.id,
-          config.pincode,
-          trackedProduct.epoch,
-        ),
-      );
-    }
-    if (restock && trackedProduct.epoch !== null) {
-      statements.push(
-        store.enqueue(
-          `stock:${config.pincode}:${trackedProduct.epoch}:${sequence}`,
-          "alert",
-          "sendMessage",
-          {
-            chat_id: env.TELEGRAM_OWNER_ID,
-            text: `Restock observed\n${product?.name ?? trackedProduct.name}\nPIN: ${config.pincode}\n${productUrl(trackedProduct.alias)}\nObserved: ${new Date(catalog.checkedAt).toISOString()}\n\nStock snapshot only, not a reservation or a guarantee of availability at checkout.`,
-            link_preview_options: { is_disabled: true },
-          },
-          { pincode: config.pincode, productId: trackedProduct.id, epoch: trackedProduct.epoch },
-        ),
-      );
-    }
   }
   statements.push(
     store.sql(
-      `UPDATE config SET last_attempt_at = ?, last_error = ?,
+      `UPDATE config SET last_attempt_at = ?, last_error = ?, upstream_retry_at = 0,
        last_success_at = CASE WHEN ? = 0 THEN ? ELSE last_success_at END WHERE id = 1`,
       catalog.checkedAt,
       unknown ? `amul_unknown_availability:${unknown}` : null,
@@ -209,5 +192,34 @@ export async function planCheck(
     ),
   );
   if (unknown) logFailure("amul_check", new SafeError(`amul_unknown_availability:${unknown}`));
-  return { statements, messages: snapshotMessages(config.pincode, catalog.checkedAt, snapshot, Boolean(config.paused)) };
+  return {
+    statements,
+    messages: includeSnapshot ? snapshotMessages(config.pincode, catalog.checkedAt, snapshot, Boolean(config.paused)) : [],
+    snapshot, selectedCount: tracked.length, unknownCount: unknown, checkedAt: catalog.checkedAt, error: null,
+  };
+}
+
+export function availabilityReminder(pincode: string, checkedAt: number, products: Product[], unknownCount: number): Message {
+  const available = products.filter((product) => product.available === 1);
+  if (!available.length) throw new SafeError("reminder_without_confirmed_availability");
+  const title = `\u2705 Available (${available.length}) \u2014 PIN ${pincode}`;
+  const details = `\nChecked: ${checkedTime(checkedAt)}${unknownCount ? `\nPartial check: ${unknownCount} selected product(s) unconfirmed; only confirmed stock is listed.` : ""}`;
+  const caveat = "\n\nAvailability snapshot, not a reservation or guaranteed at checkout.";
+  let text = `<b>${html(title)}</b>${html(details)}\n\n`;
+  let length = title.length + details.length + 2;
+  let shown = 0;
+  for (const product of available) {
+    // The rare oversized report remains ONE reminder, with explicit omission
+    // count and /checknow for full details rather than a burst of messages.
+    const reserve = caveat.length + "\n\n200 more available products. Use /checknow for the full report.".length;
+    if (length + product.name.length + 3 + reserve > 4_096) break;
+    text += `${shown ? "\n" : ""}\u2022 <a href="${productUrl(product.alias)}">${html(product.name)}</a>`;
+    length += product.name.length + 2 + (shown ? 1 : 0);
+    shown++;
+  }
+  if (!shown) throw new SafeError("reminder_product_name_too_long");
+  if (shown < available.length) {
+    text += `\n\n${available.length - shown} more available products. Use /checknow for the full report.`;
+  }
+  return { text: text + caveat, parse_mode: "HTML" };
 }

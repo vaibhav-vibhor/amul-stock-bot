@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { applyD1Migrations, createScheduledController, reset } from "cloudflare:test";
+import { applyD1Migrations, reset } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Store } from "../src/db";
 import { Network } from "../src/http";
@@ -7,19 +7,24 @@ import { productMenus } from "../src/menus";
 import type { Button } from "../src/types";
 import worker, { MAX_WEBHOOK_BYTES } from "../src";
 import { proteinNames } from "./catalog";
-import { callback, command, fixtureProduct, seedTracked, tick, Upstream, webhook } from "./helpers";
+import { callback, command, configuredFetch, configuredTick, fixtureProduct, seedTracked, tick, Upstream, webhook } from "./helpers";
 import type { TelegramCall } from "./helpers";
+import { CHECK_INTERVAL_MS } from "../src/background";
 
 let upstream: Upstream;
 let store: Store;
 let logged: unknown[][];
+let now: number;
 
 beforeEach(async () => {
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS);
   store = new Store(env.DB);
   upstream = new Upstream();
   upstream.install();
+  now = Math.floor(Date.now() / CHECK_INTERVAL_MS) * CHECK_INTERVAL_MS + 1_000;
+  vi.spyOn(Date, "now").mockImplementation(() => now);
   vi.spyOn(Network.prototype, "pause").mockResolvedValue();
+  vi.spyOn(console, "log").mockImplementation(() => {});
   logged = [];
   vi.spyOn(console, "error").mockImplementation((...values: unknown[]) => { logged.push(values); });
 });
@@ -44,7 +49,7 @@ function productButtons(call: TelegramCall): Button[] {
   return markup.inline_keyboard.flat().filter((button) => button.callback_data?.startsWith("pick:"));
 }
 
-describe("durable restock state machine", () => {
+describe("durable availability observations", () => {
   it("starts with no watches, no upstream calls and no automatic messages", async () => {
     await tick();
     expect(await store.products()).toEqual([]);
@@ -53,46 +58,53 @@ describe("durable restock state machine", () => {
     expect((await store.config()).last_success_at).toBeNull();
   });
 
-  it.each([0, 1] as const)("silently establishes a first baseline of %s", async (available) => {
+  it.each([0, 1] as const)("observes initial availability %s and reminds only for in-stock", async (available) => {
     await seedTracked();
     upstream.products = [fixtureProduct(0, available)];
     await tick();
     expect((await store.observations())[0]?.available).toBe(available);
-    expect(await alerts()).toEqual([]);
-    expect(upstream.telegram).toEqual([]);
+    expect(await alerts()).toHaveLength(available);
+    expect(upstream.telegram).toHaveLength(available);
     expect((await store.config()).last_success_at).toBeGreaterThan(0);
   });
 
-  it("alerts once per observed restock, persists across invocations and re-arms after stock-out", async () => {
+  it("repeats on distinct cycles without needing another observed stock-out", async () => {
     await seedTracked();
     await tick();
     upstream.products = [fixtureProduct(0, 1)];
+    now += CHECK_INTERVAL_MS;
     await tick();
     await tick();
     expect(await alerts()).toHaveLength(1);
     expect(upstream.telegram).toHaveLength(1);
     const text = deliveredTexts()[0]!;
     expect(text).toContain("Amul test protein 0");
-    expect(text).toContain("PIN: 500032");
+    expect(text).toContain("PIN 500032");
     expect(text).toContain("https://shop.amul.com/en/product/amul-test-protein-0");
     expect(text).toContain("not a reservation");
     upstream.products = [fixtureProduct(0, 0)];
+    now += CHECK_INTERVAL_MS;
     await tick();
     upstream.products = [fixtureProduct(0, 1)];
+    now += CHECK_INTERVAL_MS;
     await tick();
     expect(upstream.telegram).toHaveLength(2);
-    expect((await store.observations())[0]?.transition_seq).toBe(2);
+    now += CHECK_INTERVAL_MS;
+    await tick();
+    expect(upstream.telegram).toHaveLength(3);
+    expect((await store.observations())[0]?.transition_seq).toBe(0);
   });
 
-  it("preserves an in-stock baseline through UNKNOWN and cannot invent a restock", async () => {
+  it("preserves an in-stock observation through UNKNOWN and only reminds on a fresh confirmed cycle", async () => {
     await seedTracked(1);
     upstream.products = [{ ...fixtureProduct(), available: undefined }];
     await tick();
     expect((await store.observations())[0]).toMatchObject({ available: 1, checked_at: 1 });
     expect((await store.config()).last_error).toBe("amul_unknown_availability:1");
     upstream.products = [fixtureProduct(0, 1)];
+    now += CHECK_INTERVAL_MS;
     await tick();
-    expect(await alerts()).toHaveLength(0);
+    expect(await alerts()).toHaveLength(1);
   });
 
   it("preserves missing tracked products as UNKNOWN rather than stock-out", async () => {
@@ -101,7 +113,7 @@ describe("durable restock state machine", () => {
     await tick();
     expect((await store.observations())[0]).toMatchObject({ available: 1, checked_at: 1 });
     expect((await store.config()).last_success_at).toBeNull();
-    expect((await store.products()).find((product) => product.id === 1)?.active).toBe(0);
+    expect((await store.products()).find((product) => product.id === 1)?.active).toBe(1);
     expect(await alerts()).toEqual([]);
   });
 
@@ -123,7 +135,7 @@ describe("durable restock state machine", () => {
     upstream.onInventory = async () => {
       if (++pages === 2) throw new Error("simulated later-page network failure");
     };
-    await tick();
+    await webhook(command(1, "/checknow"));
     expect((await store.observations())[0]).toMatchObject({ available: 0, checked_at: 1 });
     expect(await store.products()).toHaveLength(1);
     expect(await alerts()).toEqual([]);
@@ -211,7 +223,7 @@ describe("persistent delivery and coordination", () => {
     await store.enqueue("old-owner", "reply", "sendMessage", {
       chat_id: env.TELEGRAM_OWNER_ID, text: "Private old-owner snapshot",
     }).run();
-    await worker.scheduled(createScheduledController(), { ...env, TELEGRAM_OWNER_ID: "987654321" });
+    await configuredTick(now, { ...env, TELEGRAM_OWNER_ID: "987654321" });
     expect(upstream.telegram).toEqual([]);
     expect(await store.sql("SELECT state, last_error FROM outbox WHERE dedupe_key = 'old-owner'").first())
       .toEqual({ state: "cancelled", last_error: "owner_binding_changed" });
@@ -234,6 +246,7 @@ describe("persistent delivery and coordination", () => {
     upstream.telegramResponse = () => Response.json({ ok: false, error_code: 500 }, { status: 500 });
     await tick();
     upstream.products = [fixtureProduct(0, 0)];
+    now += CHECK_INTERVAL_MS;
     await tick();
     expect((await alerts())[0]?.state).toBe("cancelled");
   });
@@ -241,7 +254,8 @@ describe("persistent delivery and coordination", () => {
   it("serializes overlapping cron checks", async () => {
     await seedTracked(0);
     upstream.products = [fixtureProduct(0, 1)];
-    await Promise.all([tick(), tick()]);
+    const overlap = await Promise.allSettled([tick(), tick()]);
+    expect(overlap.some((result) => result.status === "fulfilled")).toBe(true);
     expect(upstream.amul.filter((call) => call.url.pathname === "/entity/ms.products")).toHaveLength(1);
     expect(upstream.telegram).toHaveLength(1);
     expect(await alerts()).toHaveLength(1);
@@ -275,17 +289,16 @@ describe("persistent delivery and coordination", () => {
   it("fences stale in-flight checks after lease takeover and a PIN change", async () => {
     await seedTracked(0);
     upstream.products = [fixtureProduct(0, 1)];
-    let releaseInventory!: () => void;
-    let inventoryStarted!: () => void;
-    const started = new Promise<void>((resolve) => { inventoryStarted = resolve; });
-    const release = new Promise<void>((resolve) => { releaseInventory = resolve; });
-    upstream.onInventory = async () => { inventoryStarted(); await release; };
-    const oldCheck = tick().then(() => null, (error: unknown) => error);
-    await started;
-    await store.sql("UPDATE operation_lease SET expires_at = 0 WHERE id = 1").run();
-    expect((await webhook(command(10, "/pincode 560001"))).status).toBe(200);
-    releaseInventory();
-    expect(await oldCheck).toBeInstanceOf(Error);
+    upstream.onInventory = async () => {
+      await store.sql("UPDATE operation_lease SET expires_at = 0 WHERE id = 1").run();
+      const replacement = (await store.acquire())!;
+      await replacement.commit([
+        store.sql("UPDATE config SET pincode = '560001', revision = revision + 1 WHERE id = 1"),
+        store.sql("DELETE FROM observations"),
+      ]);
+      await replacement.release();
+    };
+    await expect(tick()).rejects.toThrow("Scheduled check failed");
     expect((await store.config()).pincode).toBe("560001");
     expect(await store.observations()).toEqual([]);
     expect(await alerts()).toEqual([]);
@@ -330,7 +343,7 @@ describe("owner-only Telegram controls", () => {
   it("has no unauthenticated mutation endpoint or missing-secret fallback", async () => {
     expect((await worker.fetch(new Request("https://bot.example/admin"), env)).status).toBe(404);
     const request = new Request("https://bot.example/telegram", { method: "POST", body: "{}" });
-    expect((await worker.fetch(request, { ...env, TELEGRAM_OWNER_ID: "" })).status).toBe(503);
+    expect((await configuredFetch(request, { ...env, TELEGRAM_OWNER_ID: "" })).status).toBe(503);
     expect(upstream.telegram).toEqual([]);
   });
 
@@ -590,14 +603,14 @@ describe("owner-only Telegram controls", () => {
       .toContain("button is stale");
   });
 
-  it("untracking/retracking establishes a new silent baseline", async () => {
+  it("untracking/retracking allows reminders on the first background observation", async () => {
     await seedTracked(0);
     await webhook(callback(1, "pick:1:1:0:1:1"));
     expect(await store.observations()).toEqual([]);
     await webhook(callback(2, "pick:2:1:1:1:1"));
     upstream.products = [fixtureProduct(0, 1)];
     await tick();
-    expect(await alerts()).toEqual([]);
+    expect(await alerts()).toHaveLength(1);
     expect((await store.observations())[0]?.available).toBe(1);
   });
 
@@ -610,10 +623,11 @@ describe("owner-only Telegram controls", () => {
     expect(await alerts()).toHaveLength(1);
   });
 
-  it("changes PIN only after validation, cancels pending old-PIN output and starts quietly", async () => {
+  it("changes PIN only after validation, cancels old-PIN output and reminds on the next background check", async () => {
     await seedTracked(0);
     upstream.products = [fixtureProduct(0, 1)];
     upstream.telegramResponse = () => Response.json({ ok: false, error_code: 500 }, { status: 500 });
+    await tick();
     await webhook(command(1, "/checknow"));
     upstream.telegramResponse = undefined;
     await webhook(command(2, "/pincode 560001"));
@@ -623,9 +637,10 @@ describe("owner-only Telegram controls", () => {
     const oldReply = await store.sql("SELECT state FROM outbox WHERE dedupe_key = 'update:1:reply:0'").first<{ state: string }>();
     expect(oldReply?.state).toBe("cancelled");
     const before = upstream.telegram.length;
+    now += CHECK_INTERVAL_MS;
     await tick();
     expect((await store.observations())[0]).toMatchObject({ pincode: "560001", available: 1 });
-    expect(upstream.telegram).toHaveLength(before);
+    expect(upstream.telegram).toHaveLength(before + 1);
   });
 
   it("does not change PIN or baselines for invalid/unserviceable arguments", async () => {
@@ -639,7 +654,7 @@ describe("owner-only Telegram controls", () => {
     expect(deliveredTexts().at(-1)).toContain("PIN not changed");
   });
 
-  it("pauses alerts, allows explicit snapshots, and resumes with silent baselines", async () => {
+  it("pauses reminders, allows explicit snapshots, and resumes on the next scheduled cycle", async () => {
     await seedTracked(0);
     await webhook(command(1, "/pause"));
     expect(await store.observations()).toEqual([]);
@@ -650,9 +665,10 @@ describe("owner-only Telegram controls", () => {
     expect(deliveredTexts().at(-1)).toContain("Paused: this snapshot does not change alert baselines.");
     expect(await store.observations()).toEqual([]);
     await webhook(command(3, "/resume"));
+    now += CHECK_INTERVAL_MS;
     await tick();
     expect((await store.observations())[0]?.available).toBe(1);
-    expect(await alerts()).toEqual([]);
+    expect(await alerts()).toHaveLength(1);
   });
 
   it("explicit /checknow may show in-stock results without a baseline alert", async () => {

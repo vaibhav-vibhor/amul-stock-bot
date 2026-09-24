@@ -1,9 +1,11 @@
 import { env } from "cloudflare:workers";
-import { createScheduledController } from "cloudflare:test";
+import { createScheduledController, runInDurableObject } from "cloudflare:test";
 import { vi } from "vitest";
 import worker from "../src";
+import bot from "../src/bot";
+import { MONITOR_NAME } from "../src/monitor";
 import { Store } from "../src/db";
-import type { Availability } from "../src/types";
+import type { Availability, Env } from "../src/types";
 
 export function fixtureProduct(index = 0, available: unknown = 0) {
   return {
@@ -29,6 +31,7 @@ export class Upstream {
   failure: { path: string; status: number; retryAfter?: string; body?: string } | undefined;
   wrongRegion = false;
   repeatPage = false;
+  ignoreAliasFilter = false;
   badGuest = false;
   preferenceText = "Updated successfully";
   onInventory: (() => Promise<void>) | undefined;
@@ -102,7 +105,12 @@ export class Upstream {
         }
         const start = this.repeatPage ? 0 : Number(url.searchParams.get("start"));
         const limit = Number(url.searchParams.get("limit"));
-        return Response.json({ total: 3, records: this.products.slice(start, start + limit) });
+        const filters = JSON.parse(url.searchParams.get("filters")!) as { field: string; value: unknown }[];
+        const aliases = filters.find((filter) => filter.field === "alias")?.value;
+        const products = Array.isArray(aliases) && !this.ignoreAliasFilter
+          ? this.products.filter((product) => typeof product === "object" && product !== null && "alias" in product && aliases.includes(product.alias))
+          : this.products;
+        return Response.json({ total: 3, records: products.slice(start, start + limit) });
       }
       throw new Error("Unexpected Amul test endpoint");
     });
@@ -150,13 +158,32 @@ export function callback(id: number, data: string, callbackId = `fictional-callb
 }
 
 export async function webhook(update: unknown, secret = env.TELEGRAM_WEBHOOK_SECRET) {
-  return worker.fetch(new Request("https://bot.example/telegram", {
+  const response = await worker.fetch(new Request("https://bot.example/telegram", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Telegram-Bot-Api-Secret-Token": secret },
     body: JSON.stringify(update),
   }), env);
+  // Finish the DO response stream before test storage/instances are reset.
+  return new Response(await response.arrayBuffer(), response);
 }
 
-export async function tick(): Promise<void> {
-  await worker.scheduled(createScheduledController({ cron: "*/5 * * * *" }), env);
+export async function tick(scheduledTime = Date.now()): Promise<void> {
+  await worker.scheduled(createScheduledController({ cron: "*/5 * * * *", scheduledTime }), env);
+}
+
+export async function configuredFetch(request: Request, config: Env): Promise<Response> {
+  const body = await request.text();
+  const url = request.url;
+  const method = request.method;
+  const headers = [...request.headers];
+  const response = await runInDurableObject(env.MONITOR.getByName(MONITOR_NAME), () =>
+    bot.fetch(new Request(url, { method, headers, body }), config),
+  );
+  return new Response(await response.arrayBuffer(), response);
+}
+
+export async function configuredTick(scheduledTime: number, config: Env): Promise<void> {
+  return runInDurableObject(env.MONITOR.getByName(MONITOR_NAME), () =>
+    bot.scheduled({ scheduledTime, cron: "*/5 * * * *" }, config),
+  );
 }

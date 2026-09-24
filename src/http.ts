@@ -1,6 +1,7 @@
 import { SafeError } from "./errors";
 
 export const REQUEST_TIMEOUT_MS = 6_000;
+export const TELEGRAM_TIMEOUT_MS = 10_000;
 export const OPERATION_TIMEOUT_MS = 45_000;
 export const MAX_SUBREQUESTS = 32;
 
@@ -73,7 +74,7 @@ export class Network {
         ...options,
         redirect: "manual",
         signal: AbortSignal.timeout(
-          Math.min(REQUEST_TIMEOUT_MS, this.remaining()),
+          Math.min(service === "telegram" ? TELEGRAM_TIMEOUT_MS : REQUEST_TIMEOUT_MS, this.remaining()),
         ),
       });
       const text = await limitedText(response, maximumBytes);

@@ -190,29 +190,38 @@ export class Amul {
     return region;
   }
 
-  async catalog(pincode: string): Promise<Catalog> {
+  async catalog(pincode: string, aliases?: string[]): Promise<Catalog> {
+    if (aliases && (!aliases.length || aliases.length > MAX_PRODUCTS ||
+        aliases.some((alias) => !ALIAS.test(alias)) || new Set(aliases).size !== aliases.length)) {
+      throw new SafeError("amul_invalid_alias_filter");
+    }
+    const requested = aliases ? new Set(aliases) : null;
     const region = await this.bind(pincode);
     const products: Product[] = [];
-    const aliases = new Set<string>();
+    const seenAliases = new Set<string>();
     for (let start = 0; start <= MAX_PRODUCTS; start += PAGE_SIZE) {
       // No fields[...] projection: it disables linked-inventory enrichment.
       const page = records(
         await this.api("/entity/ms.products", {
           limit: String(PAGE_SIZE),
           start: String(start),
-          filters: JSON.stringify([{ field: "categories", value: ["protein"], operator: "in" }]),
+          filters: JSON.stringify([
+            { field: "categories", value: ["protein"], operator: "in" },
+            ...(aliases ? [{ field: "alias", value: aliases, operator: "in" }] : []),
+          ]),
         }),
       );
       if (page.length > PAGE_SIZE) throw new SafeError("amul_invalid_page");
       for (const value of page) {
         const product = parseProduct(value);
-        if (aliases.has(product.alias)) throw new SafeError("amul_repeated_page");
-        aliases.add(product.alias);
+        if (requested && !requested.has(product.alias)) throw new SafeError("amul_filtered_unexpected_product");
+        if (seenAliases.has(product.alias)) throw new SafeError("amul_repeated_page");
+        seenAliases.add(product.alias);
         products.push(product);
       }
       if (products.length > MAX_PRODUCTS) throw new SafeError("amul_catalog_limit");
       if (page.length < PAGE_SIZE) {
-        if (!products.length) throw new SafeError("amul_empty_catalog");
+        if (!products.length && !requested) throw new SafeError("amul_empty_catalog");
         return { pincode, region, products, checkedAt: Date.now() };
       }
     }

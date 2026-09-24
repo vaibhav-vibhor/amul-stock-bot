@@ -1,12 +1,13 @@
 import type { Delivery, Lease, TelegramMethod } from "./db";
 import { errorCode, json, logFailure, object, SafeError } from "./errors";
-import { Network, retryAfter } from "./http";
+import { Network, retryAfter, TELEGRAM_TIMEOUT_MS } from "./http";
 import type { Env, OwnerUpdate } from "./types";
 
 export function validateEnv(env: Env): void {
   if (
     !/^\d{5,16}:[A-Za-z0-9_-]{20,100}$/.test(env.TELEGRAM_BOT_TOKEN ?? "") ||
     !/^[A-Za-z0-9_-]{32,256}$/.test(env.TELEGRAM_WEBHOOK_SECRET ?? "") ||
+    !/^(true|false)$/.test(env.MONITORING_ENABLED ?? "") ||
     !/^[1-9]\d{0,15}$/.test(env.TELEGRAM_OWNER_ID ?? "") ||
     !Number.isSafeInteger(Number(env.TELEGRAM_OWNER_ID))
   ) {
@@ -115,7 +116,82 @@ async function send(
   );
 }
 
-export async function flushOutbox(env: Env, lease: Lease, network: Network): Promise<void> {
+async function deliverClaimed(env: Env, lease: Lease, network: Network, delivery: Delivery): Promise<boolean> {
+  const store = lease.store;
+  try {
+    await send(env, network, delivery.method, delivery.payload);
+  } catch (error) {
+    logFailure("telegram_delivery", error);
+    const retry = error instanceof SafeError ? error.retryAfterSeconds : 0;
+    const backoff = Math.min(3_600, 30 * 2 ** Math.min(Math.max(0, delivery.attempts - 1), 7));
+    await lease.commit([
+      store.sql(
+        "UPDATE outbox SET next_attempt_at = ?, last_error = ? WHERE id = ?",
+        Date.now() + Math.max(backoff, retry) * 1_000, errorCode(error), delivery.id,
+      ),
+      store.sql(
+        "UPDATE config SET telegram_retry_at = MAX(telegram_retry_at, ?) WHERE id = 1",
+        retry ? Date.now() + retry * 1_000 : 0,
+      ),
+    ]);
+    return false;
+  }
+  await lease.commit([
+    store.sql(
+      `UPDATE outbox SET state = 'acknowledged', acknowledged_at = ?, last_error = NULL
+       WHERE id = ? AND state = 'pending'`,
+      Date.now(), delivery.id,
+    ),
+  ]);
+  if (delivery.kind === "alert") {
+    console.log(JSON.stringify({ operation: "reminder_acknowledged", scheduledAt: delivery.scheduled_at }));
+  }
+  return true;
+}
+
+export async function deliverCurrentReminder(env: Env, lease: Lease, network: Network): Promise<void> {
+  if (network.remaining() < TELEGRAM_TIMEOUT_MS + 1_000 || network.remainingRequests() < 1) return;
+  const store = lease.store;
+  const now = Date.now();
+  // The cleanup and send claim share the same fenced D1 round trip. No other
+  // await occurs between this minimum-15-second lease check and the send.
+  const results = await lease.commit<Delivery>([
+    store.sql(
+      `UPDATE outbox SET state = 'cancelled', last_error = CASE
+         WHEN CAST(json_extract(payload, '$.chat_id') AS TEXT) IS NOT ? THEN 'owner_binding_changed' ELSE 'obsolete' END
+       WHERE kind = 'alert' AND state = 'pending' AND NOT EXISTS (
+         SELECT 1 FROM config c JOIN background_cycles b ON b.scheduled_at = outbox.scheduled_at
+         WHERE c.id = 1 AND c.paused = 0 AND c.pincode = outbox.pincode
+           AND c.revision = outbox.config_revision AND b.config_revision = c.revision
+           AND b.outcome IN ('available', 'partial')
+           AND b.scheduled_at = (SELECT MAX(scheduled_at) FROM background_cycles)
+           AND outbox.expires_at > ?
+           AND CAST(json_extract(outbox.payload, '$.chat_id') AS TEXT) = ?
+           AND EXISTS (SELECT 1 FROM tracked_products)
+       )`,
+      env.TELEGRAM_OWNER_ID, now + 15_000, env.TELEGRAM_OWNER_ID,
+    ),
+    store.sql(
+      `DELETE FROM outbox WHERE id IN (
+         SELECT id FROM outbox WHERE state != 'pending' AND created_at < ? LIMIT 100
+       )`,
+      now - 30 * 86_400_000,
+    ),
+    store.sql(
+      `UPDATE outbox SET attempts = attempts + 1, next_attempt_at = ?
+       WHERE id = (
+         SELECT id FROM outbox WHERE state = 'pending' AND kind = 'alert'
+           AND next_attempt_at <= ? AND (SELECT telegram_retry_at FROM config WHERE id = 1) <= ?
+         ORDER BY id DESC LIMIT 1
+       ) RETURNING *`,
+      now + 120_000, now, now,
+    ),
+  ], null, 15);
+  const delivery = results.at(-1)?.results[0];
+  if (delivery) await deliverClaimed(env, lease, network, delivery);
+}
+
+export async function flushOutbox(env: Env, lease: Lease, network: Network, includeReminders = true): Promise<void> {
   const store = lease.store;
   const now = Date.now();
   await lease.commit([
@@ -131,13 +207,17 @@ export async function flushOutbox(env: Env, lease: Lease, network: Network): Pro
            SELECT 1 FROM config c WHERE c.id = 1 AND c.revision = outbox.config_revision
          )) OR
          (kind = 'alert' AND NOT EXISTS (
-           SELECT 1 FROM config c JOIN tracked_products t ON t.product_id = outbox.product_id
+           SELECT 1 FROM config c JOIN background_cycles b ON b.scheduled_at = outbox.scheduled_at
            WHERE c.id = 1 AND c.paused = 0 AND c.pincode = outbox.pincode
-             AND t.epoch = outbox.watch_epoch
+             AND c.revision = outbox.config_revision
+             AND b.config_revision = c.revision AND b.outcome IN ('available', 'partial')
+             AND b.scheduled_at = (SELECT MAX(scheduled_at) FROM background_cycles)
+             AND outbox.expires_at > ? AND EXISTS (SELECT 1 FROM tracked_products)
          )))`,
       env.TELEGRAM_OWNER_ID,
       env.TELEGRAM_OWNER_ID,
       now,
+      now + 15_000,
     ),
     store.sql(
       `DELETE FROM outbox WHERE id IN (
@@ -149,8 +229,10 @@ export async function flushOutbox(env: Env, lease: Lease, network: Network): Pro
   if ((await store.config()).telegram_retry_at > Date.now()) return;
   const deliveries = await store.sql(
     `SELECT * FROM outbox WHERE state = 'pending' AND next_attempt_at <= ?
+     AND (? = 1 OR kind != 'alert')
      ORDER BY CASE kind WHEN 'callback' THEN 0 WHEN 'reply' THEN 1 ELSE 2 END, id LIMIT 30`,
     now,
+    includeReminders ? 1 : 0,
   ).all<Delivery>();
 
   let menuDeliveries = 0;
@@ -159,9 +241,16 @@ export async function flushOutbox(env: Env, lease: Lease, network: Network): Pro
     const isMenu = /^update:\d+:menu:\d+$/.test(delivery.dedupe_key);
     if (isMenu ? menuDeliveries >= 24 : ordinaryDeliveries >= 6) continue;
     const paceMenu = isMenu && menuDeliveries > 0;
-    if (network.remaining() < (paceMenu ? 8_100 : 7_000) || network.remainingRequests() < 1) break;
+    if (network.remaining() < TELEGRAM_TIMEOUT_MS + 1_000 + (paceMenu ? 1_100 : 0) || network.remainingRequests() < 1) break;
     // Large requested catalogs are consecutive private-chat replies, not a burst.
     if (paceMenu) await network.pause(1_100);
+    if (delivery.kind === "alert" && (delivery.expires_at === null || delivery.expires_at <= Date.now() + 15_000)) {
+      await lease.commit([store.sql(
+        "UPDATE outbox SET state = 'cancelled', last_error = 'expired_cycle' WHERE id = ?",
+        delivery.id,
+      )]);
+      continue;
+    }
     if (isMenu) menuDeliveries++;
     else ordinaryDeliveries++;
     // No config mutation can acquire this lease during the bounded external send.
@@ -173,35 +262,7 @@ export async function flushOutbox(env: Env, lease: Lease, network: Network): Pro
         delivery.id,
       ),
     ]);
-    try {
-      await lease.assertOwned(15);
-      await send(env, network, delivery.method, delivery.payload);
-    } catch (error) {
-      logFailure("telegram_delivery", error);
-      const retry = error instanceof SafeError ? error.retryAfterSeconds : 0;
-      const backoff = Math.min(3_600, 30 * 2 ** Math.min(delivery.attempts, 7));
-      await lease.commit([
-        store.sql(
-          "UPDATE outbox SET next_attempt_at = ?, last_error = ? WHERE id = ?",
-          Date.now() + Math.max(backoff, retry) * 1_000,
-          errorCode(error),
-          delivery.id,
-        ),
-        store.sql(
-          "UPDATE config SET telegram_retry_at = MAX(telegram_retry_at, ?) WHERE id = 1",
-          retry ? Date.now() + retry * 1_000 : 0,
-        ),
-      ]);
-      // Respect Telegram-wide rate limits and avoid repeatedly hitting a broken token/chat.
-      break;
-    }
-    await lease.commit([
-      store.sql(
-        `UPDATE outbox SET state = 'acknowledged', acknowledged_at = ?, last_error = NULL
-         WHERE id = ? AND state = 'pending'`,
-        Date.now(),
-        delivery.id,
-      ),
-    ]);
+    await lease.assertOwned(15);
+    if (!await deliverClaimed(env, lease, network, { ...delivery, attempts: delivery.attempts + 1 })) break;
   }
 }

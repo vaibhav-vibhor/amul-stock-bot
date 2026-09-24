@@ -12,6 +12,7 @@ export default defineConfig(async () => ({
           TELEGRAM_BOT_TOKEN: "123456:FAKE_TEST_TOKEN_NOT_A_REAL_CREDENTIAL",
           TELEGRAM_WEBHOOK_SECRET: "FAKE_TEST_WEBHOOK_SECRET_NOT_A_REAL_SECRET",
           TELEGRAM_OWNER_ID: "123456789",
+          MONITORING_ENABLED: "true",
         },
       },
     }),
