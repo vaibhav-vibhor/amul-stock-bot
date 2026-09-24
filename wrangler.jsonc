@@ -1,0 +1,26 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "amul-stock-bot",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  // Enable only after real scheduled-path CPU/delivery verification succeeds.
+  "vars": { "MONITORING_ENABLED": "false" },
+  "durable_objects": {
+    "bindings": [{ "name": "MONITOR", "class_name": "PersonalMonitor" }]
+  },
+  "migrations": [
+    { "tag": "v1-personal-monitor", "new_sqlite_classes": ["PersonalMonitor"] }
+  ],
+  // A future deployment activates this schedule. Nothing is deployed by CI.
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "amul-stock-bot",
+      // Deliberately not a database UUID. Create D1 and replace before deployment.
+      "database_id": "SETUP_REQUIRED_REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ]
+}
