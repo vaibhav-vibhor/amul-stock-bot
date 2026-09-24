@@ -2,10 +2,48 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { Amul, parseProduct, productUrl, validPincode } from "../src/amul";
 import { limitedText, MAX_SUBREQUESTS, Network, retryAfter } from "../src/http";
 import { fixtureProduct, Upstream } from "./helpers";
+import { regionalResponse } from "./fixtures/amul-regional-response";
 
 afterEach(() => vi.restoreAllMocks());
 
 describe("regional Amul protocol", () => {
+  it("reads representative linked regional records using catalog identity and effective availability", async () => {
+    const upstream = new Upstream();
+    const fetch = upstream.install();
+    const protocol = fetch.getMockImplementation()!;
+    fetch.mockImplementation((input, options) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      return url.pathname === "/entity/ms.products"
+        ? Promise.resolve(Response.json(regionalResponse))
+        : protocol(input, options);
+    });
+    const catalog = await new Amul(new Network()).catalog("500032");
+    expect(catalog).toMatchObject({
+      pincode: "500032", region: "telangana",
+      products: regionalResponse.records.map(({ alias, name, available }) => ({ alias, name, available })),
+    });
+    const whey = regionalResponse.records[1]!;
+    expect(whey._id).not.toBe(whey.linked_product_id);
+    expect(whey.inventory_quantity).toBeGreaterThan(0);
+    expect(catalog.products[1]?.available).toBe(0);
+    expect(productUrl(catalog.products[1]!.alias)).toBe(`https://shop.amul.com/en/product/${whey.alias}`);
+  });
+
+  it("retains linked fixture identities but treats missing/malformed fresh availability as UNKNOWN", async () => {
+    const upstream = new Upstream();
+    const { available: _available, ...missingFlag } = regionalResponse.records[0]!;
+    upstream.products = [
+      missingFlag,
+      { ...regionalResponse.records[1]!, available: "1" },
+    ];
+    upstream.install();
+    const catalog = await new Amul(new Network()).catalog("500032", regionalResponse.records.map((product) => product.alias));
+    expect(catalog.products).toEqual(regionalResponse.records.map(({ alias, name }) => ({
+      alias, name, available: null,
+    })));
+    expect(regionalResponse.records.map((product) => product.available)).toEqual([1, 0]);
+  });
+
   it("uses exact PIN lookup, guest cookies, signed headers and plain-text preferences", async () => {
     const upstream = new Upstream();
     upstream.products = [fixtureProduct(0, 1), fixtureProduct(1, 0)];

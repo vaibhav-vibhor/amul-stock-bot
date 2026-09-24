@@ -1,21 +1,23 @@
 import { randomBytes } from "node:crypto";
 import { createInterface } from "node:readline";
+import { resolve } from "node:path";
 import { Writable } from "node:stream";
+import { pathToFileURL } from "node:url";
 
 class SetupError extends Error {}
 
-function prompt(label, secret = false) {
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+export function prompt(label, secret = false, { stdin = process.stdin, stdout = process.stdout } = {}) {
+  if (!stdin.isTTY || !stdout.isTTY) {
     throw new SetupError("Run this helper in an interactive terminal. Secrets are accepted only by masked prompts, never command arguments.");
   }
   let muted = false;
   const output = new Writable({
     write(chunk, _encoding, done) {
-      if (!muted) process.stdout.write(chunk);
+      if (!muted) stdout.write(chunk);
       done();
     },
   });
-  const input = createInterface({ input: process.stdin, output, terminal: true });
+  const input = createInterface({ input: stdin, output, terminal: true });
   return new Promise((resolve, reject) => {
     let settled = false;
     input.once("close", () => {
@@ -31,7 +33,7 @@ function prompt(label, secret = false) {
       settled = true;
       muted = false;
       input.close();
-      if (secret) process.stdout.write("\n");
+      if (secret) stdout.write("\n");
       resolve(answer.trim());
     });
     muted = secret;
@@ -59,7 +61,7 @@ async function telegram(token, method, body = {}) {
   return data.result;
 }
 
-async function discover(token) {
+async function discover(token, ask) {
   const webhook = await telegram(token, "getWebhookInfo");
   if (webhook.url) {
     throw new SetupError("This bot already has a webhook. Discovery will not remove it or interfere with an existing bot. Use a new dedicated bot.");
@@ -67,7 +69,7 @@ async function discover(token) {
   const challenge = `/bind ${randomBytes(16).toString("hex")}`;
   const since = Math.floor(Date.now() / 1_000) - 5;
   console.log(`From your own PRIVATE chat with this bot, send exactly:\n${challenge}`);
-  await prompt("Press Enter after sending the challenge: ");
+  await ask("Press Enter after sending the challenge: ");
   if (Date.now() / 1_000 - since > 300) {
     throw new SetupError("The five-minute challenge expired. Rerun discovery.");
   }
@@ -95,14 +97,14 @@ async function discover(token) {
   }
   const id = ids[0];
   console.log(`Matching private Telegram user ID: ${id}`);
-  if (await prompt("To confirm this is YOUR challenge, type that numeric ID: ") !== id) {
+  if (await ask("To confirm this is YOUR challenge, type that numeric ID: ") !== id) {
     throw new SetupError("Owner confirmation did not match. No binding was changed.");
   }
   console.log(`Verified locally. Put ${id} into TELEGRAM_OWNER_ID using Wrangler's secret prompt. This helper did not store the token, bind a Worker, or send a Telegram message.`);
 }
 
-async function registerWebhook(token) {
-  const value = await prompt("Deployed HTTPS webhook URL (ending in /telegram): ");
+async function registerWebhook(token, ask) {
+  const value = await ask("Deployed HTTPS webhook URL (ending in /telegram): ");
   let url;
   try {
     url = new URL(value);
@@ -118,11 +120,11 @@ async function registerWebhook(token) {
   if (current.url && current.url !== url.href) {
     throw new SetupError("This bot is bound to a DIFFERENT webhook. Refusing to overwrite it or modify an existing bot.");
   }
-  const secret = await prompt("The SAME TELEGRAM_WEBHOOK_SECRET already stored in the Worker (hidden): ", true);
+  const secret = await ask("The SAME TELEGRAM_WEBHOOK_SECRET already stored in the Worker (hidden): ", true);
   if (!/^[A-Za-z0-9_-]{32,256}$/.test(secret)) {
     throw new SetupError("Webhook secret must be 32-256 letters, digits, underscores or hyphens.");
   }
-  if (await prompt("Type REGISTER to register this webhook and discard pending setup updates: ") !== "REGISTER") {
+  if (await ask("Type REGISTER to register this webhook and discard pending setup updates: ") !== "REGISTER") {
     throw new SetupError("Not registered.");
   }
   const result = await telegram(token, "setWebhook", {
@@ -139,12 +141,12 @@ async function registerWebhook(token) {
   console.log("Webhook URL registered and verified. No Telegram sendMessage request was made. /start in your private chat can now verify end-to-end owner binding.");
 }
 
-async function main() {
-  const mode = process.argv[2];
-  if (process.argv.length !== 3 || !["discover", "webhook"].includes(mode)) {
+async function main(args, ask) {
+  const mode = args[0];
+  if (args.length !== 1 || !["discover", "webhook"].includes(mode)) {
     throw new SetupError("Usage: npm run telegram:setup -- discover | webhook. Never put a token or secret in command arguments.");
   }
-  const token = await prompt("Dedicated bot's BotFather token (hidden): ", true);
+  const token = await ask("Dedicated bot's BotFather token (hidden): ", true);
   if (!/^\d{5,16}:[A-Za-z0-9_-]{20,100}$/.test(token)) {
     throw new SetupError("Token format is invalid.");
   }
@@ -152,14 +154,23 @@ async function main() {
   if (!bot?.is_bot || typeof bot.username !== "string" || !/^[A-Za-z0-9_]+$/.test(bot.username)) {
     throw new SetupError("Telegram did not identify a bot username.");
   }
-  if (await prompt(`Intended bot is @${bot.username}. Type its username to confirm: `) !== bot.username) {
+  if (await ask(`Intended bot is @${bot.username}. Type its username to confirm: `) !== bot.username) {
     throw new SetupError("Bot confirmation did not match. No configuration was changed.");
   }
-  if (mode === "discover") await discover(token);
-  else await registerWebhook(token);
+  if (mode === "discover") await discover(token, ask);
+  else await registerWebhook(token, ask);
 }
 
-main().catch((error) => {
-  console.error(error instanceof SetupError ? error.message : "Setup failed unexpectedly. No sensitive error details are printed.");
-  process.exitCode = 1;
-});
+export async function runSetup(args = process.argv.slice(2), ask = prompt) {
+  try {
+    await main(args, ask);
+    return 0;
+  } catch (error) {
+    console.error(error instanceof SetupError ? error.message : "Setup failed unexpectedly. No sensitive error details are printed.");
+    return 1;
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  process.exitCode = await runSetup();
+}

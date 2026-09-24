@@ -45,15 +45,30 @@ Use Node.js LTS 24 (22.12+ supported) and npm:
 
 ```powershell
 npm ci
-npm run typecheck
-node --check scripts\telegram-setup.mjs
-npm test
-npm run build
+npm run check
 ```
 
-`npm test` executes in the local Workers runtime with a real SQLite-backed DO, local D1, production migrations, non-secret fixtures and **mocked Amul/Telegram fetches**. It exercises the actual public scheduled entrypoint and DO RPC for first/unchanged/adjacent cycles, one-message consolidation, duplicate tick idempotency, manual/background separation, pause/resume, empty watches, unknown/error preservation, configuration/owner changes, outbox retry/rate limits, expiry/backlog recovery, overlapping work, stale leases, populated-schema migration preservation and transactional rollback. Runtime tests verify one object, SQLite availability, no competing alarm, object eviction/restart, preserved D1 results/retries, error propagation, private RPC and dual-gate disable behavior. Selector and snapshot regressions remain covered. Tests send no real messages and create no remote resources.
+`npm run check` is the same fail-fast gate used by CI: source/test typechecks, setup-helper syntax check, **all** tests, then the existing dry-run bundle. It disables Wrangler telemetry/disk logging and the banner's registry-update lookup for its child processes, needs no Cloudflare/Telegram credentials, and never deploys. A failed stage prevents later stages from running.
+
+`npm test` runs both `test:workers` (Vitest in the local Workers runtime with a real SQLite-backed DO and local D1) and `test:node` (Node's built-in test runner for the setup helper and gate/hook). External Amul/Telegram HTTP is **mocked**. Coverage includes the complete empty-state owner journey using emitted selection callbacks and real public webhook/DO dispatch, five-minute recurring reminders, pause/resume, configuration/owner changes, retries/fencing, eviction/restart and migration preservation. Checked-in Wrangler JSONC is parsed with Wrangler's own parser and checked against the source cadence/binding contracts; ignored live/auth config is not used.
+
+Node helper tests exercise the real masked-readline prompt using in-memory terminal streams, explicit confirmation, private ownership challenges, refusal to overwrite another webhook, TTY enforcement, cancellation and sanitized errors. They use fictional credentials and write no credentials. Gate tests simulate failed stages and invoke the optional hook with a temporary fake `npm`, without installing a hook or changing Git configuration.
+
+`test/fixtures/amul-regional-response.ts` is a compact reconstruction from the sanitized public regional feasibility report of **2026-09-22**. It retains representative names, aliases, numeric availability/quantities/prices and the distinct catalog/linked-product-ID relationship; both IDs are replaced with fictional fixture labels. No guest identifiers, cookies, headers, images or descriptions are retained. It is **not current stock** or a complete upstream schema capture. Offline fixtures cannot detect future API drift; runtime response validation and a deliberately refreshed public fixture remain necessary when the storefront changes.
 
 `npm run build` is only `wrangler deploy --dry-run`. It does not deploy. The tests' fake credentials are not usable tokens. For a manually configured local development instance, copy `.dev.vars.example` to `.dev.vars`, populate it privately, apply migrations with `--local`, then use `npm run dev`. Local development does not receive Telegram webhooks without a deliberately configured public tunnel; do not register one inadvertently.
+
+### Optional pre-push check (explicit opt-in)
+
+The repository includes `.githooks/pre-push`, which only runs `npm run check`. Nothing installs or enables it automatically. For one push from the repository root, with Node/npm on `PATH`:
+
+```powershell
+git -c core.hooksPath=.githooks push
+```
+
+This override applies only to that command and needs no installation/removal; omit it on future commands to stop opting in. **Do not use this override if you already rely on a different pre-push hook**: Git selects one hook directory, so run `npm run check` manually followed by your normal push instead. No existing hook files are overwritten. The shell hook is checked in executable for Git's POSIX hook runner, including Git for Windows.
+
+In a linked worktree, `git config --local core.hooksPath ...` can change the primary checkout and sibling worktrees because the local configuration is shared. Do not use it for this optional setup, and do not enable worktree-config extensions merely to install a check. No global/shared/worktree Git configuration is changed by the per-command example. Hooks are a local convenience and can be bypassed; CI remains the authoritative gate.
 
 ## Manual setup (not performed by this implementation)
 

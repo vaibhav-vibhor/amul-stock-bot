@@ -9,7 +9,10 @@
   "scripts": {
     "dev": "wrangler dev",
     "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
-    "test": "vitest run",
+    "test": "npm run test:workers && npm run test:node",
+    "test:workers": "vitest run",
+    "test:node": "node --test test/node/*.test.mjs",
+    "check": "node scripts/check.mjs",
     "build": "wrangler deploy --dry-run --outdir dist",
     "telegram:setup": "node scripts/telegram-setup.mjs"
   },
